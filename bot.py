@@ -1,8 +1,7 @@
 
-
 import os
-import asyncio
 import logging
+import asyncio
 import yfinance as yf
 import pandas as pd
 
@@ -13,7 +12,10 @@ from telegram.ext import (
     ContextTypes,
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -35,7 +37,8 @@ def get_signal(symbol, ticker):
     try:
         df = yf.Ticker(ticker).history(
             period="5d",
-            interval=TIMEFRAME
+            interval=TIMEFRAME,
+            auto_adjust=False,
         )
 
         if df.empty or len(df) < 60:
@@ -43,24 +46,29 @@ def get_signal(symbol, ticker):
 
         df = df.dropna().copy()
 
-        # Use completed candles only
+        # Використовуємо тільки закриті свічки
         df = df.iloc[:-1].copy()
 
-        if len(df) < 30:
+        if len(df) < 55:
             return None
 
-        df["EMA20"] = df["Close"].ewm(
+        close = df["Close"]
+        high = df["High"]
+        low = df["Low"]
+
+        df["EMA20"] = close.ewm(
             span=20, adjust=False
         ).mean()
 
-        df["EMA50"] = df["Close"].ewm(
+        df["EMA50"] = close.ewm(
             span=50, adjust=False
         ).mean()
 
-        delta = df["Close"].diff()
+        delta = close.diff()
         gain = delta.clip(lower=0).ewm(
             alpha=1 / 14, adjust=False
         ).mean()
+
         loss = (-delta.clip(upper=0)).ewm(
             alpha=1 / 14, adjust=False
         ).mean()
@@ -68,12 +76,13 @@ def get_signal(symbol, ticker):
         rs = gain / loss.replace(0, float("nan"))
         df["RSI"] = 100 - (100 / (1 + rs))
 
-        previous_close = df["Close"].shift(1)
+        previous_close = close.shift(1)
+
         tr = pd.concat(
             [
-                df["High"] - df["Low"],
-                (df["High"] - previous_close).abs(),
-                (df["Low"] - previous_close).abs(),
+                high - low,
+                (high - previous_close).abs(),
+                (low - previous_close).abs(),
             ],
             axis=1,
         ).max(axis=1)
@@ -81,9 +90,9 @@ def get_signal(symbol, ticker):
         df["ATR"] = tr.rolling(14).mean()
 
         current = df.iloc[-1]
-        previous = df.iloc[-11:-1]
+        recent = df.iloc[-5:-1]
 
-        if previous.empty or pd.isna(current["ATR"]):
+        if current[["EMA20", "EMA50", "RSI", "ATR"]].isna().any():
             return None
 
         entry = float(current["Close"])
@@ -93,19 +102,26 @@ def get_signal(symbol, ticker):
         if atr <= 0:
             return None
 
-        resistance = float(previous["High"].max())
-        support = float(previous["Low"].min())
-
+        # BUY: висхідний тренд, відкат до EMA20
+        # і пробій максимуму попередньої свічки
         bullish = (
             current["EMA20"] > current["EMA50"]
-            and entry > resistance
-            and 52 <= rsi <= 68
+            and recent["Low"].min()
+            <= recent["EMA20"].max() * 1.002
+            and entry > float(df["High"].iloc[-2])
+            and entry > current["EMA20"]
+            and 50 <= rsi <= 68
         )
 
+        # SELL: низхідний тренд, відкат до EMA20
+        # і пробій мінімуму попередньої свічки
         bearish = (
             current["EMA20"] < current["EMA50"]
-            and entry < support
-            and 32 <= rsi <= 48
+            and recent["High"].max()
+            >= recent["EMA20"].min() * 0.998
+            and entry < float(df["Low"].iloc[-2])
+            and entry < current["EMA20"]
+            and 32 <= rsi <= 50
         )
 
         if not bullish and not bearish:
@@ -129,7 +145,9 @@ def get_signal(symbol, ticker):
                 entry - 3 * risk,
             ]
 
-        candle_time = str(df.index[-1])
+        digits = 2 if symbol == "XAU/USD" else (
+            1 if symbol == "BTC/USD" else 5
+        )
 
         return {
             "symbol": symbol,
@@ -138,114 +156,87 @@ def get_signal(symbol, ticker):
             "sl": sl,
             "targets": targets,
             "rsi": rsi,
-            "time": candle_time,
+            "time": str(df.index[-1]),
+            "digits": digits,
         }
 
     except Exception:
-        logging.exception("Data error for %s", symbol)
+        logging.exception("Помилка аналізу %s", symbol)
         return None
 
 
-def format_price(symbol, price):
-    digits = 2 if symbol == "XAU/USD" else (
-        1 if symbol == "BTC/USD" else 5
-    )
-    return f"{price:.{digits}f}"
-
-
 def format_signal(signal):
-    symbol = signal["symbol"]
-
-    targets = "\n".join(
-        f"TP{i}: {format_price(symbol, price)}"
-        for i, price in enumerate(signal["targets"], 1)
-    )
+    d = signal["digits"]
+    fmt = lambda price: f"{price:.{d}f}"
 
     return (
-        f"📊 DMYTRO GOLD SIGNALS\n\n"
-        f"Інструмент: {symbol}\n"
+        "📊 DMYTRO GOLD SIGNALS\n\n"
+        f"Інструмент: {signal['symbol']}\n"
         f"Напрямок: {signal['direction']}\n"
         f"Таймфрейм: {TIMEFRAME}\n\n"
-        f"Вхід: {format_price(symbol, signal['entry'])}\n"
-        f"Stop Loss: {format_price(symbol, signal['sl'])}\n"
-        f"{targets}\n\n"
+        f"Вхід: {fmt(signal['entry'])}\n"
+        f"Stop Loss: {fmt(signal['sl'])}\n"
+        f"TP1: {fmt(signal['targets'][0])}\n"
+        f"TP2: {fmt(signal['targets'][1])}\n"
+        f"TP3: {fmt(signal['targets'][2])}\n\n"
         f"RSI: {signal['rsi']:.1f}\n"
-        f"Підтвердження: EMA20/EMA50 + пробій "
-        f"+ RSI\n"
         f"Час свічки: {signal['time']}\n\n"
-        f"⚠️ Сигнал автоматичний. Перевір котирування "
-        f"та ризик перед входом."
+        "⚠️ Сигнал автоматичний. Перевір спред "
+        "і ризик перед входом."
     )
 
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     subscribers.add(chat_id)
 
-    await update.message.reply_text(
-        "Вітаю! Це Dmytro Gold Signals.\n\n"
-        "Інструменти: XAU/USD, EUR/USD, "
-        "GBP/USD, BTC/USD.\n"
-        "Таймфрейм: 15 хвилин.\n"
-        "Три тейки: TP1, TP2, TP3.\n\n"
-        "Сигнали надсилаються лише після "
-        "підтвердження умов.\n\n"
+    await update.effective_message.reply_text(
+        "✅ Бот підключений!\n\n"
+        "Інструменти: XAU/USD, EUR/USD, GBP/USD, BTC/USD\n"
+        "Таймфрейм: 15 хвилин\n"
+        "Перевірка ринку: кожні 5 хвилин\n\n"
+        "Сигнали надходитимуть за наявності умов.\n\n"
+        "/status — стан бота\n"
+        "/symbols — інструменти\n"
+        "/help — допомога"
+    )
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "✅ Бот запущений.\n"
+        f"Інструментів: {len(SYMBOLS)}\n"
+        f"Підписників: {len(subscribers)}\n"
+        f"Таймфрейм: {TIMEFRAME}\n"
+        f"Перевірка: кожні {CHECK_MINUTES} хвилин."
+    )
+
+
+async def symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "Інструменти:\n"
+        "• XAU/USD — золото\n"
+        "• EUR/USD\n"
+        "• GBP/USD\n"
+        "• BTC/USD"
+    )
+
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.effective_message.reply_text(
+        "/start — підключити сигнали\n"
         "/status — стан бота\n"
         "/symbols — список інструментів\n"
         "/help — допомога"
     )
 
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.message.reply_text(
-        "/start — підключити отримання сигналів\n"
-        "/status — перевірити роботу бота\n"
-        "/symbols — список інструментів\n"
-        "/help — допомога\n\n"
-        "Бот надсилає сигнали, а не відкриває "
-        "угоди автоматично."
-    )
-
-
-async def symbols_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.message.reply_text(
-        "📈 Інструменти:\n"
-        "• XAU/USD — золото (GC=F)\n"
-        "• EUR/USD\n"
-        "• GBP/USD\n"
-        "• BTC/USD\n\n"
-        "Таймфрейм: 15m\n"
-        "Тейки: TP1, TP2, TP3"
-    )
-
-
-async def status(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.message.reply_text(
-        "Бот запущений.\n"
-        f"Інструментів: {len(SYMBOLS)}\n"
-        f"Підписників у поточному запуску: "
-        f"{len(subscribers)}\n"
-        "Дані: Yahoo Finance\n"
-        "Сигнали: після підтвердження умов."
-    )
-
-
-async def scan_markets(
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def scan_markets(context: ContextTypes.DEFAULT_TYPE):
     if not subscribers:
+        logging.info("Немає підписників. Надішли боту /start.")
         return
 
     for symbol, ticker in SYMBOLS.items():
@@ -254,6 +245,7 @@ async def scan_markets(
         )
 
         if signal is None:
+            logging.info("%s: умов для сигналу немає", symbol)
             continue
 
         key = (symbol, signal["direction"])
@@ -268,30 +260,29 @@ async def scan_markets(
             try:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=message
+                    text=message,
                 )
             except Exception:
                 logging.exception(
-                    "Could not send message to %s",
-                    chat_id
+                    "Не вдалося надіслати повідомлення"
                 )
 
         last_signals[key] = signature
 
 
 async def post_init(application: Application):
-    await application.bot.set_my_commands([
-        ("start", "Підключити сигнали"),
-        ("status", "Стан бота"),
-        ("symbols", "Список інструментів"),
-        ("help", "Допомога"),
-    ])
+    application.job_queue.run_repeating(
+        scan_markets,
+        interval=CHECK_MINUTES * 60,
+        first=10,
+        name="market_scan",
+    )
 
 
 def main():
     if not TOKEN:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is not configured"
+            "TELEGRAM_BOT_TOKEN не налаштований у Railway."
         )
 
     app = (
@@ -302,16 +293,9 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("symbols", symbols_command))
-
-    app.job_queue.run_repeating(
-        scan_markets,
-        interval=CHECK_MINUTES * 60,
-        first=10,
-        name="market_scan",
-    )
+    app.add_handler(CommandHandler("symbols", symbols))
+    app.add_handler(CommandHandler("help", help_command))
 
     app.run_polling()
 
