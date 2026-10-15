@@ -10,7 +10,7 @@ import yfinance as yf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 CHECK_MINUTES = 5
 NEWS_LEAD_MINUTES = int(os.getenv("NEWS_LEAD_MINUTES", "30"))
