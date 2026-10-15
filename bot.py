@@ -10,7 +10,7 @@ import yfinance as yf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 CHECK_MINUTES = 5
 NEWS_LEAD_MINUTES = int(os.getenv("NEWS_LEAD_MINUTES", "30"))
@@ -345,20 +345,9 @@ def analyze(label, ticker):
     if side == "SELL" and not 32 <= rsi <= 55:
         return None, f"{label}: RSI {rsi:.1f} поза фільтром SELL"
 
-    # Use an older, completed range to define SNR; keep the last 5 candles
-    # separate so a breakout can actually occur beyond that range.
-    if len(x) < 230:
-        return None, f"{label}: недостатньо свічок для MA200 та структури"
-    reference = x.iloc[-27:-6]
-    resistance, support = float(reference.High.max()), float(reference.Low.min())
-    fvg = latest_fvg(x.iloc[:-1], side)
-
-    # Conservative H1 moving-average alignment filter for higher-quality setups.
-    ma50_now, ma100_now, ma200_now = float(a.MA50), float(a.MA100), float(a.MA200)
-    if side == "BUY" and not (close > ma200_now and ma50_now > ma100_now):
-        return None, f"{label}: MA-фільтр не підтверджує BUY"
-    if side == "SELL" and not (close < ma200_now and ma50_now < ma100_now):
-        return None, f"{label}: MA-фільтр не підтверджує SELL"
+    recent = x.tail(22).iloc[:-1]
+    resistance, support = float(recent.High.max()), float(recent.Low.min())
+    fvg = latest_fvg(x, side)
     if side == "BUY":
         zone_reaction = float(a.Low) <= support + .2*atr and close > float(a.Open) and close > float(prev.Close)
         fvg_reaction = fvg is not None and float(a.Low) <= fvg[1] and float(a.High) >= fvg[0] and close > float(a.Open)
@@ -401,7 +390,6 @@ def format_signal(s):
             f"Вхід: <code>{s['entry']:.{p}f}</code>\nSL: <code>{s['sl']:.{p}f}</code>\n"
             f"TP1: <code>{s['tps'][0]:.{p}f}</code>\nTP2: <code>{s['tps'][1]:.{p}f}</code>\n"
             f"TP3: <code>{s['tps'][2]:.{p}f}</code>\nRSI(14) H1: <b>{s['rsi']:.1f}</b>\n"
-            f"🔴 MA50: <code>{s['ma50']:.{p}f}</code> | 🔵 MA100: <code>{s['ma100']:.{p}f}</code> | 🟢 MA200: <code>{s['ma200']:.{p}f}</code>\n"
             f"Підтвердження: {s['reason']}\nКонтекст: 1W → 1D → H4 → H1\nЧас: {s['time']}\n\n"
             "⚠️ Алгоритмічний сигнал, не гарантія прибутку.")
 
