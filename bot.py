@@ -10,7 +10,7 @@ import yfinance as yf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 CHECK_MINUTES = 5
 NEWS_LEAD_MINUTES = int(os.getenv("NEWS_LEAD_MINUTES", "30"))
@@ -345,32 +345,35 @@ def analyze(label, ticker):
     if side == "SELL" and not 32 <= rsi <= 55:
         return None, f"{label}: RSI {rsi:.1f} поза фільтром SELL"
 
-    recent = x.tail(22).iloc[:-1]
-    resistance, support = float(recent.High.max()), float(recent.Low.min())
+    # SNR-рівні беремо з попередньої ділянки, не з тих самих свічок пробою
+    recent = x.iloc[-27:-6]
+    if len(recent) < 10:
+        return None, f"{label}: недостатньо даних для SNR"
+    resistance = float(recent["High"].max())
+    support = float(recent["Low"].min())
     fvg = latest_fvg(x, side)
+    prior = x.iloc[-6:-1]
+
     if side == "BUY":
-        zone_reaction = float(a.Low) <= support + .2*atr and close > float(a.Open) and close > float(prev.Close)
-        fvg_reaction = fvg is not None and float(a.Low) <= fvg[1] and float(a.High) >= fvg[0] and close > float(a.Open)
-        # Retest is checked after a recent prior breakout of resistance.
-        prior = x.iloc[-6:-1]
-        had_breakout = bool((prior.Close > resistance).any())
-        retest = had_breakout and float(a.Low) <= resistance + .15*atr and close > resistance and close > float(a.Open)
+        zone_reaction = (float(a.Low) <= support + 0.2*atr and close > float(a.Open) and close > float(prev.Close))
+        fvg_reaction = (fvg is not None and float(a.Low) <= fvg[1] and float(a.High) >= fvg[0] and close > float(a.Open))
+        had_breakout = bool((prior["Close"] > resistance).any())
+        retest = had_breakout and float(a.Low) <= resistance + 0.15*atr and close > resistance and close > float(a.Open)
         confirmed = zone_reaction or fvg_reaction or retest
         reason = "пробій + ретест SNR" if retest else "реакція від FVG" if fvg_reaction else "реакція від підтримки SNR"
-        sl = min(float(a.Low), support) - .25*atr
-        risk = close-sl
-        tps = [close+r*risk for r in (1,2,3)]
+        sl = min(float(a.Low), support) - 0.25*atr
+        risk = close - sl
+        tps = [close + r*risk for r in (1, 2, 3)]
     else:
-        zone_reaction = float(a.High) >= resistance - .2*atr and close < float(a.Open) and close < float(prev.Close)
-        fvg_reaction = fvg is not None and float(a.High) >= fvg[0] and float(a.Low) <= fvg[1] and close < float(a.Open)
-        prior = x.iloc[-6:-1]
-        had_breakout = bool((prior.Close < support).any())
-        retest = had_breakout and float(a.High) >= support - .15*atr and close < support and close < float(a.Open)
+        zone_reaction = (float(a.High) >= resistance - 0.2*atr and close < float(a.Open) and close < float(prev.Close))
+        fvg_reaction = (fvg is not None and float(a.High) >= fvg[0] and float(a.Low) <= fvg[1] and close < float(a.Open))
+        had_breakout = bool((prior["Close"] < support).any())
+        retest = had_breakout and float(a.High) >= support - 0.15*atr and close < support and close < float(a.Open)
         confirmed = zone_reaction or fvg_reaction or retest
         reason = "пробій + ретест SNR" if retest else "реакція від FVG" if fvg_reaction else "реакція від опору SNR"
-        sl = max(float(a.High), resistance) + .25*atr
-        risk = sl-close
-        tps = [close-r*risk for r in (1,2,3)]
+        sl = max(float(a.High), resistance) + 0.25*atr
+        risk = sl - close
+        tps = [close - r*risk for r in (1, 2, 3)]
     if not confirmed or risk <= 0:
         return None, f"{label}: немає підтвердження H1"
     decimals = 3 if label in ("EUR/JPY",) else 2 if label in ("XAU/USD","XAG/USD","BTC/USD") else 5
@@ -384,14 +387,27 @@ def analyze(label, ticker):
 
 
 def format_signal(s):
-    p=s["decimals"]
-    side="🟢 BUY" if s["side"]=="BUY" else "🔴 SELL"
-    return (f"📊 <b>{s['symbol']} — {side}</b>\n"
-            f"Вхід: <code>{s['entry']:.{p}f}</code>\nSL: <code>{s['sl']:.{p}f}</code>\n"
-            f"TP1: <code>{s['tps'][0]:.{p}f}</code>\nTP2: <code>{s['tps'][1]:.{p}f}</code>\n"
-            f"TP3: <code>{s['tps'][2]:.{p}f}</code>\nRSI(14) H1: <b>{s['rsi']:.1f}</b>\n"
-            f"Підтвердження: {s['reason']}\nКонтекст: 1W → 1D → H4 → H1\nЧас: {s['time']}\n\n"
-            "⚠️ Алгоритмічний сигнал, не гарантія прибутку.")
+    p = s["decimals"]
+    side = "🟢 BUY" if s["side"] == "BUY" else "🔴 SELL"
+    ma50 = f"{s['ma50']:.{p}f}" if s.get("ma50") is not None else "немає даних"
+    ma100 = f"{s['ma100']:.{p}f}" if s.get("ma100") is not None else "немає даних"
+    ma200 = f"{s['ma200']:.{p}f}" if s.get("ma200") is not None else "немає даних"
+    return (
+        f"📊 <b>{s['symbol']} — {side}</b>\n"
+        f"Вхід: <code>{s['entry']:.{p}f}</code>\n"
+        f"SL: <code>{s['sl']:.{p}f}</code>\n"
+        f"TP1: <code>{s['tps'][0]:.{p}f}</code>\n"
+        f"TP2: <code>{s['tps'][1]:.{p}f}</code>\n"
+        f"TP3: <code>{s['tps'][2]:.{p}f}</code>\n"
+        f"RSI(14) H1: <b>{s['rsi']:.1f}</b>\n\n"
+        f"🔴 MA50: <code>{ma50}</code>\n"
+        f"🔵 MA100: <code>{ma100}</code>\n"
+        f"🟢 MA200: <code>{ma200}</code>\n\n"
+        f"Підтвердження: {s['reason']}\n"
+        f"Контекст: 1W → 1D → H4 → H1\n"
+        f"Час: {s['time']}\n\n"
+        "⚠️ Алгоритмічний сигнал, не гарантія прибутку."
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
