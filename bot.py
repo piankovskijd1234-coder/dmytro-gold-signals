@@ -64,12 +64,6 @@ def trend(df):
     return "NEUTRAL"
 
 
-def stochastic(df):
-    lo, hi = df["low"].rolling(14).min(), df["high"].rolling(14).max()
-    raw = 100 * (df["close"] - lo) / (hi - lo).replace(0, float("nan"))
-    k = raw.rolling(3).mean()
-    return k, k.rolling(3).mean()
-
 
 def snr(df, n=30):
     d = df.iloc[:-1].tail(n)
@@ -135,22 +129,18 @@ def timeframe_setups(frame, label):
     return out
 
 
-def analyze(h1, m15, h4, d1, w1):
-    if min(len(h4), len(d1), len(w1)) < 205 or len(h1) < 35 or len(m15) < 40:
-        return None, "Недостатньо історичних даних для W1/D1/H4/H1/M15"
+def analyze(h1, h4, d1, w1):
+    """W1/D1 context, H4 direction, H1 setup and H1 candle confirmation. No Stochastic/M15."""
+    if min(len(h4), len(d1), len(w1)) < 205 or len(h1) < 35:
+        return None, "Недостатньо історичних даних для W1/D1/H4/H1"
 
-    # SNR/RB/FVG are assessed on EVERY timeframe, not only H1.
     all_tf = {
         "W1": timeframe_setups(w1, "W1"),
         "D1": timeframe_setups(d1, "D1"),
         "H4": timeframe_setups(h4, "H4"),
         "H1": timeframe_setups(h1, "H1"),
-        "M15": timeframe_setups(m15, "M15"),
     }
-
     tw, td, th = trend(w1), trend(d1), trend(h4)
-    # H4 trend uses EMA structure where available, with price/EMA50 as a fallback
-    # when EMA50/100/200 are not perfectly stacked.
     if th == "NEUTRAL" and len(h4) >= 55:
         h4close = float(h4["close"].iloc[-2])
         h4ema50 = float(h4["close"].ewm(span=50, adjust=False).mean().iloc[-2])
@@ -163,55 +153,32 @@ def analyze(h1, m15, h4, d1, w1):
 
     side = "BUY" if th == "BULL" else "SELL"
     reasons = []
-    for tf in ("W1", "D1", "H4", "H1", "M15"):
+    for tf in ("W1", "D1", "H4", "H1"):
         reasons.extend(all_tf[tf][side])
-
-    # A setup must be present on at least one of W1/D1/H4/H1.
     if not reasons:
-        return None, f"{side}: немає підтвердженої реакції SNR/RB/FVG на W1/D1/H4/H1/M15"
+        return None, f"{side}: немає реакції SNR/RB/FVG на W1/D1/H4/H1"
 
-    # M15 final confirmation. Stochastic requires a completed-candle exit from 20/80
-    # with K/D crossover. If no Stochastic exit, require a directional candle confirmation.
-    m = m15.iloc[:-1]
-    x, y = m.iloc[-1], m.iloc[-2]
-    mop, mcl, mpcl = float(x.open), float(x.close), float(y.close)
-    k, d = stochastic(m)
-    stoch_side = None
-    stoch_text = None
-    if len(k.dropna()) >= 2 and len(d.dropna()) >= 2:
-        kp, kn, dp, dn = float(k.iloc[-2]), float(k.iloc[-1]), float(d.iloc[-2]), float(d.iloc[-1])
-        if kp < 20 and dp < 20 and kn >= 20 and kp <= dp and kn > dn:
-            stoch_side, stoch_text = "BUY", f"M15 Stochastic вихід із перепроданості (%K={kn:.1f}, %D={dn:.1f})"
-        elif kp > 80 and dp > 80 and kn <= 80 and kp >= dp and kn < dn:
-            stoch_side, stoch_text = "SELL", f"M15 Stochastic вихід із перекупленості (%K={kn:.1f}, %D={dn:.1f})"
-
-    # M15 confirmation can come from any of three routes:
-    # 1) directional candle close; 2) local SNR/FVG/RB reaction; 3) Stochastic exit.
-    # Keep the candle closed before evaluating signals.
-    m15_setups = timeframe_setups(m15, "M15")
-    m15_zone_reasons = m15_setups[side]
-    if side == "BUY":
-        m15_candle_confirm = mcl > mop and mcl > mpcl
-    else:
-        m15_candle_confirm = mcl < mop and mcl < mpcl
-
-    m15_confirm_routes = []
-    if m15_candle_confirm:
-        m15_confirm_routes.append("M15: свічкове підтвердження")
-    if m15_zone_reasons:
-        m15_confirm_routes.extend(m15_zone_reasons)
-    if stoch_side == side and stoch_text:
-        m15_confirm_routes.append(stoch_text)
-
-    if not m15_confirm_routes:
-        return None, f"{side}: зона H1/H4 є, але M15 не підтвердив свічкою, SNR/FVG/RB або Stochastic"
-    reasons.extend(m15_confirm_routes)
-
-    # Entry at last completed M15 close; stop based on recent H1 structure.
-    entry = mcl
+    # H1 confirmation uses the latest COMPLETED H1 candle, never the live candle.
     h = h1.iloc[:-1]
-    h1_high = float(h.iloc[-1].high)
-    h1_low = float(h.iloc[-1].low)
+    if len(h) < 6:
+        return None, "Недостатньо закритих свічок H1"
+    cur, prev = h.iloc[-1], h.iloc[-2]
+    op, cl, prev_close = float(cur.open), float(cur.close), float(prev.close)
+    h1_setups = all_tf["H1"][side]
+    if side == "BUY":
+        candle_confirm = cl > op and cl > prev_close
+    else:
+        candle_confirm = cl < op and cl < prev_close
+
+    if not candle_confirm and not h1_setups:
+        return None, f"{side}: є зона, але H1 ще не підтвердив напрямок закритою свічкою або реакцією SNR/RB/FVG"
+    if candle_confirm:
+        reasons.append("H1: підтвердження закритою свічкою в напрямку сигналу")
+    if h1_setups:
+        reasons.extend(h1_setups)
+
+    entry = cl
+    h1_high, h1_low = float(h.iloc[-1].high), float(h.iloc[-1].low)
     if side == "BUY":
         structure = min(h1_low, float(h.tail(5).low.min()))
         sl = structure - max(abs(entry) * 0.001, abs(h1_high-h1_low) * 0.25)
@@ -230,7 +197,7 @@ def analyze(h1, m15, h4, d1, w1):
     return {
         "side": side, "entry": entry, "sl": sl, "tp": targets,
         "reasons": reasons, "context": f"W1={tw}, D1={td}, H4={th}",
-        "h1": str(h.index[-1]), "m15": str(m.index[-1]),
+        "h1": str(h.index[-1]),
     }, "Signal"
 
 def fmt(sym, x):
@@ -244,9 +211,9 @@ def message(sym, s):
     icon = "🟢" if s["side"] == "BUY" else "🔴"
     why = "\n".join("• "+r for r in s["reasons"])
     return (f"{icon} <b>{s['side']} — {sym}</b>\n"
-            f"Entry M15: {fmt(sym,s['entry'])}\nSL: {fmt(sym,s['sl'])}\n"
+            f"Entry H1: {fmt(sym,s['entry'])}\nSL: {fmt(sym,s['sl'])}\n"
             f"TP1: {fmt(sym,s['tp'][0])}\nTP2: {fmt(sym,s['tp'][1])}\nTP3: {fmt(sym,s['tp'][2])}\n\n"
-            f"Причини:\n{why}\nКонтекст: {s['context']}\nH1: {s['h1']}\nM15: {s['m15']}\n"
+            f"Причини:\n{why}\nКонтекст: {s['context']}\nПідтвердження: H1 закрита свічка\nH1: {s['h1']}\n"
             "⚠️ Сигнал не гарантує прибутку; перевір спред і ризик.")
 
 
@@ -255,18 +222,17 @@ async def scan(app, report_id=None):
     for sym, ticker in SYMBOLS.items():
         try:
             h1 = download(ticker, "60d", "1h")
-            m15 = download(ticker, "60d", "15m")
             d1 = download(ticker, "2y", "1d")
             w1 = download(ticker, "5y", "1wk")
-            if any(x.empty for x in (h1,m15,d1,w1)):
+            if any(x.empty for x in (h1,d1,w1)):
                 diagnostics.append(f"{sym}: немає даних від Yahoo Finance")
                 continue
             h4 = h1.resample("4h").agg({"open":"first","high":"max","low":"min","close":"last"}).dropna()
-            setup, reason = analyze(h1,m15,h4,d1,w1)
+            setup, reason = analyze(h1,h4,d1,w1)
             if not setup:
                 diagnostics.append(f"{sym}: {reason}")
                 continue
-            key = f"{sym}|{setup['side']}|{setup['m15']}"
+            key = f"{sym}|{setup['side']}|{setup['h1']}"
             if key in ALERTED:
                 diagnostics.append(f"{sym}: сигнал для цієї свічки вже надсилався")
                 continue
@@ -293,15 +259,15 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_subscribers()
     await update.effective_message.reply_text(
         f"Бот активний. Сканування кожні {INTERVAL} хв.\n"
-        "W1/D1 контекст → H4 напрямок → H1 зона → M15 підтвердження.\n"
-        "Входи: SNR, RB-патерн, FVG, Stochastic OB/OS, пробій + ретест.\n"
+        "W1/D1 контекст → H4 напрямок → H1 зона та підтвердження.\n"
+        "Входи: SNR, RB-патерн, FVG; без Stochastic і M15.\n"
         "Команди: /status /symbols /scan /help")
 
 
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Запущений. Інтервал {INTERVAL} хв. Підписників: {len(SUBSCRIBERS)}.\n"
-        "W1/D1 → H4 → H1 → M15. Автоматичні угоди вимкнені.")
+        "W1/D1 → H4 → H1 підтвердження. Stochastic вимкнений; автоматичні угоди вимкнені.")
 
 
 async def symbols(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
