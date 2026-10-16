@@ -89,75 +89,136 @@ def fvg(df):
     return None
 
 
+def timeframe_setups(frame, label):
+    """Detect approximate SNR, FVG and RB-style reactions on a completed candle."""
+    out = {"BUY": [], "SELL": []}
+    if frame.empty or len(frame) < 25:
+        return out
+    data = frame.iloc[:-1]  # don't use the candle still forming
+    if len(data) < 20:
+        return out
+    cur, prev = data.iloc[-1], data.iloc[-2]
+    op, cl, hi, lo = map(float, (cur.open, cur.close, cur.high, cur.low))
+    pop, pcl, phi, plo = map(float, (prev.open, prev.close, prev.high, prev.low))
+
+    # SNR zone: approximate recent support/resistance from the prior 20 completed bars.
+    lookback = data.iloc[-21:-1]
+    if len(lookback) >= 10:
+        support = float(lookback.low.min())
+        resistance = float(lookback.high.max())
+        if lo <= support * 1.002 and cl > op and cl > support:
+            out["BUY"].append(f"{label} SNR: bullish reaction near support")
+        if hi >= resistance * 0.998 and cl < op and cl < resistance:
+            out["SELL"].append(f"{label} SNR: bearish reaction near resistance")
+
+    # FVG: most recent three-candle imbalance and current price reaction into it.
+    gap = None
+    for i in range(len(data)-1, max(1, len(data)-40), -1):
+        left, right = data.iloc[i-2], data.iloc[i]
+        if float(left.high) < float(right.low):
+            gap = ("BUY", float(left.high), float(right.low))
+            break
+        if float(left.low) > float(right.high):
+            gap = ("SELL", float(right.high), float(left.low))
+            break
+    if gap:
+        if gap[0] == "BUY" and lo <= gap[2] and cl > op and cl >= gap[1]:
+            out["BUY"].append(f"{label} FVG: bullish gap reaction")
+        if gap[0] == "SELL" and hi >= gap[1] and cl < op and cl <= gap[2]:
+            out["SELL"].append(f"{label} FVG: bearish gap reaction")
+
+    # RB is a heuristic reversal-block proxy based on a reversal candle taking prior high/low.
+    if pcl < pop and cl > op and cl > phi:
+        out["BUY"].append(f"{label} RB: bullish reversal pattern")
+    if pcl > pop and cl < op and cl < plo:
+        out["SELL"].append(f"{label} RB: bearish reversal pattern")
+    return out
+
+
 def analyze(h1, m15, h4, d1, w1):
     if min(len(h4), len(d1), len(w1)) < 205 or len(h1) < 35 or len(m15) < 40:
-        return None, "Недостатньо історії для W1/D1/H4/H1/M15"
+        return None, "Недостатньо історичних даних для W1/D1/H4/H1/M15"
+
+    # SNR/RB/FVG are assessed on EVERY timeframe, not only H1.
+    all_tf = {
+        "W1": timeframe_setups(w1, "W1"),
+        "D1": timeframe_setups(d1, "D1"),
+        "H4": timeframe_setups(h4, "H4"),
+        "H1": timeframe_setups(h1, "H1"),
+        "M15": timeframe_setups(m15, "M15"),
+    }
+
     tw, td, th = trend(w1), trend(d1), trend(h4)
+    # H4 trend uses EMA structure where available, with price/EMA50 as a fallback
+    # when EMA50/100/200 are not perfectly stacked.
+    if th == "NEUTRAL" and len(h4) >= 55:
+        h4close = float(h4["close"].iloc[-2])
+        h4ema50 = float(h4["close"].ewm(span=50, adjust=False).mean().iloc[-2])
+        if h4close > h4ema50:
+            th = "BULL"
+        elif h4close < h4ema50:
+            th = "BEAR"
     if th == "NEUTRAL":
-        return None, f"H4 нейтральний (W1={tw}, D1={td}, H4={th})"
+        return None, f"H4 нейтральний; W1={tw}, D1={td}, H4={th}; SNR/RB/FVG перевірено"
+
     side = "BUY" if th == "BULL" else "SELL"
-    h = h1.iloc[:-1]
-    a, b = h.iloc[-1], h.iloc[-2]
-    op, cl, hi, lo = map(float, (a.open, a.close, a.high, a.low))
-    pop, pcl, phi, plo = map(float, (b.open, b.close, b.high, b.low))
-    support, resistance = snr(h1)
-    gap = fvg(h1)
     reasons = []
-    if side == "BUY":
-        if support and lo <= support * 1.002 and cl > op and cl > support:
-            reasons.append("SNR support reaction")
-        if gap and gap[0] == "BULL" and lo <= gap[2] and cl > op and cl >= gap[1]:
-            reasons.append("Bullish FVG reaction")
-        if pcl < pop and cl > op and cl > phi:
-            reasons.append("RB-style bullish reversal")
-    else:
-        if resistance and hi >= resistance * .998 and cl < op and cl < resistance:
-            reasons.append("SNR resistance reaction")
-        if gap and gap[0] == "BEAR" and hi >= gap[1] and cl < op and cl <= gap[2]:
-            reasons.append("Bearish FVG reaction")
-        if pcl > pop and cl < op and cl < plo:
-            reasons.append("RB-style bearish reversal")
-    prev = h.iloc[-22:-2]
-    if len(prev) >= 10:
-        r, s = float(prev.high.max()), float(prev.low.min())
-        if side == "BUY" and pcl > r and lo <= r * 1.002 and cl > r and cl > op:
-            reasons.append("Breakout + retest")
-        if side == "SELL" and pcl < s and hi >= s * .998 and cl < s and cl < op:
-            reasons.append("Breakdown + retest")
-    # Final confirmation on the last fully closed M15 candle.
+    for tf in ("W1", "D1", "H4", "H1", "M15"):
+        reasons.extend(all_tf[tf][side])
+
+    # A setup must be present on at least one of W1/D1/H4/H1.
+    if not reasons:
+        return None, f"{side}: немає підтвердженої реакції SNR/RB/FVG на W1/D1/H4/H1/M15"
+
+    # M15 final confirmation. Stochastic requires a completed-candle exit from 20/80
+    # with K/D crossover. If no Stochastic exit, require a directional candle confirmation.
     m = m15.iloc[:-1]
     x, y = m.iloc[-1], m.iloc[-2]
     mop, mcl, mpcl = float(x.open), float(x.close), float(y.close)
     k, d = stochastic(m)
-    stoch_reason = None
+    stoch_side = None
+    stoch_text = None
     if len(k.dropna()) >= 2 and len(d.dropna()) >= 2:
         kp, kn, dp, dn = float(k.iloc[-2]), float(k.iloc[-1]), float(d.iloc[-2]), float(d.iloc[-1])
         if kp < 20 and dp < 20 and kn >= 20 and kp <= dp and kn > dn:
-            stoch_reason = ("BUY", "Stochastic exit from oversold + K/D cross")
+            stoch_side, stoch_text = "BUY", f"M15 Stochastic вихід із перепроданості (%K={kn:.1f}, %D={dn:.1f})"
         elif kp > 80 and dp > 80 and kn <= 80 and kp >= dp and kn < dn:
-            stoch_reason = ("SELL", "Stochastic exit from overbought + K/D cross")
-    if stoch_reason and stoch_reason[0] == side:
-        reasons.append(stoch_reason[1])
-    if not reasons:
-        return None, f"{side}: H1 не знайшов підтвердження SNR/RB/FVG/Stochastic"
-    if side == "BUY" and not (mcl > mop and mcl > mpcl):
-        return None, "H1 зона знайдена, але немає бичачого підтвердження M15"
-    if side == "SELL" and not (mcl < mop and mcl < mpcl):
-        return None, "H1 зона знайдена, але немає ведмежого підтвердження M15"
-    entry = mcl
+            stoch_side, stoch_text = "SELL", f"M15 Stochastic вихід із перекупленості (%K={kn:.1f}, %D={dn:.1f})"
+
     if side == "BUY":
-        sl = min(lo, float(h.tail(5).low.min())) - max(abs(entry)*.001, abs(hi-lo)*.25)
-        risk = entry-sl
-        if risk <= 0: return None, "SL invalid"
+        m15_confirmed = mcl > mop and mcl > mpcl
+    else:
+        m15_confirmed = mcl < mop and mcl < mpcl
+    if stoch_side == side:
+        reasons.append(stoch_text)
+    elif not m15_confirmed:
+        return None, f"{side}: H1/H4 зона є, але немає підтвердження M15"
+
+    # Entry at last completed M15 close; stop based on recent H1 structure.
+    entry = mcl
+    h = h1.iloc[:-1]
+    h1_high = float(h.iloc[-1].high)
+    h1_low = float(h.iloc[-1].low)
+    if side == "BUY":
+        structure = min(h1_low, float(h.tail(5).low.min()))
+        sl = structure - max(abs(entry) * 0.001, abs(h1_high-h1_low) * 0.25)
+        risk = entry - sl
+        if risk <= 0:
+            return None, "Не вдалося коректно розрахувати SL"
         targets = [entry+risk, entry+2*risk, entry+3*risk]
     else:
-        sl = max(hi, float(h.tail(5).high.max())) + max(abs(entry)*.001, abs(hi-lo)*.25)
-        risk = sl-entry
-        if risk <= 0: return None, "SL invalid"
+        structure = max(h1_high, float(h.tail(5).high.max()))
+        sl = structure + max(abs(entry) * 0.001, abs(h1_high-h1_low) * 0.25)
+        risk = sl - entry
+        if risk <= 0:
+            return None, "Не вдалося коректно розрахувати SL"
         targets = [entry-risk, entry-2*risk, entry-3*risk]
-    return {"side":side,"entry":entry,"sl":sl,"tp":targets,"reasons":reasons,
-            "context":f"W1={tw}, D1={td}, H4={th}","h1":str(h.index[-1]),"m15":str(m.index[-1])}, "Signal"
 
+    return {
+        "side": side, "entry": entry, "sl": sl, "tp": targets,
+        "reasons": reasons, "context": f"W1={tw}, D1={td}, H4={th}",
+        "h1": str(h.index[-1]), "m15": str(m.index[-1]),
+    }, "Signal"
 
 def fmt(sym, x):
     if sym == "BTC/USD": return f"{x:,.2f}"
