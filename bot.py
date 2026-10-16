@@ -271,96 +271,137 @@ def detect_setups(frame, label, lookback=30):
     return result
 
 
+def rsi_series(close, period=14):
+    """RSI using Wilder-style exponential smoothing."""
+    delta = close.astype(float).diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(avg_loss != 0, 100)
+    rsi = rsi.where(avg_gain != 0, 0)
+    return rsi
+
+
+def detect_smc_rsi(h1_closed):
+    """Find recent RSI reversal + liquidity sweep + CHoCH/BOS + FVG/OB confluence."""
+    if h1_closed.empty or len(h1_closed) < 60:
+        return None, "Недостатньо H1-свічок для RSI та Smart Money"
+
+    df = h1_closed.copy()
+    df["rsi"] = rsi_series(df["close"])
+    # Look for a recent complete setup, but avoid using the forming candle.
+    start_i = max(25, len(df) - 8)
+    found = None
+    for i in range(start_i, len(df)):
+        row = df.iloc[i]
+        prev = df.iloc[i - 1]
+        prior20 = df.iloc[max(0, i - 20):i]
+        if len(prior20) < 15 or pd.isna(row.rsi) or pd.isna(prev.rsi):
+            continue
+
+        # RSI must leave an extreme zone: SELL crosses back below 70; BUY back above 30.
+        sell_rsi = float(prev.rsi) >= 70 and float(row.rsi) < 70
+        buy_rsi = float(prev.rsi) <= 30 and float(row.rsi) > 30
+
+        prior_high = float(prior20.high.max())
+        prior_low = float(prior20.low.min())
+        sweep_sell = float(row.high) > prior_high and float(row.close) < prior_high
+        sweep_buy = float(row.low) < prior_low and float(row.close) > prior_low
+
+        # CHoCH/BOS confirmation must happen on the sweep candle or within the next 4 closed bars.
+        later = df.iloc[i:min(i + 5, len(df))]
+        if later.empty:
+            continue
+        structure_buy = False
+        structure_sell = False
+        for j in range(i, min(i + 5, len(df))):
+            candle = df.iloc[j]
+            before = df.iloc[max(0, j - 5):j]
+            if len(before) < 3:
+                continue
+            if float(candle.close) > float(before.high.max()):
+                structure_buy = True
+            if float(candle.close) < float(before.low.min()):
+                structure_sell = True
+
+        # Smart Money zone confirmation: a nearby three-candle FVG or a reversal OB proxy.
+        scan = df.iloc[max(0, i - 12):min(i + 5, len(df))]
+        fvg_buy = fvg_sell = ob_buy = ob_sell = False
+        for k in range(2, len(scan)):
+            left, middle, right = scan.iloc[k - 2], scan.iloc[k - 1], scan.iloc[k]
+            if float(left.high) < float(right.low):
+                gap_mid = (float(left.high) + float(right.low)) / 2
+                if abs(float(row.close) - gap_mid) <= max(abs(float(row.close)) * 0.004, float(row.high-row.low) * 4):
+                    fvg_buy = True
+            if float(left.low) > float(right.high):
+                gap_mid = (float(right.high) + float(left.low)) / 2
+                if abs(float(row.close) - gap_mid) <= max(abs(float(row.close)) * 0.004, float(row.high-row.low) * 4):
+                    fvg_sell = True
+            # Order-block proxy: opposing candle before a strong displacement candle.
+            if float(middle.close) < float(middle.open) and float(right.close) > float(right.open) and float(right.close) > float(middle.high):
+                ob_buy = True
+            if float(middle.close) > float(middle.open) and float(right.close) < float(right.open) and float(right.close) < float(middle.low):
+                ob_sell = True
+
+        if buy_rsi and sweep_buy and structure_buy and (fvg_buy or ob_buy):
+            found = {"side": "BUY", "index": i, "rsi": float(row.rsi),
+                     "reasons": ["RSI: повернення вище 30 після перепроданості",
+                                 "SMC: зняття ліквідності під локальними мінімумами",
+                                 "SMC: бичачий CHoCH/BOS",
+                                 "SMC: bullish FVG або Order Block"]}
+        elif sell_rsi and sweep_sell and structure_sell and (fvg_sell or ob_sell):
+            found = {"side": "SELL", "index": i, "rsi": float(row.rsi),
+                     "reasons": ["RSI: повернення нижче 70 після перекупленості",
+                                 "SMC: зняття ліквідності над локальними максимумами",
+                                 "SMC: ведмежий CHoCH/BOS",
+                                 "SMC: bearish FVG або Order Block"]}
+        if found:
+            break
+
+    if not found:
+        return None, "Немає повного збігу: RSI 70/30 + sweep ліквідності + CHoCH/BOS + FVG/OB"
+    return found, "Setup"
+
+
 def analyze(h1, h4, d1, w1):
-    """W1/D1 context; H4/H1 SNR-RB-FVG; closed H1 candle confirms. No M15/Stochastic."""
-    if len(h1) < 40 or len(h4) < 30 or len(d1) < 30 or len(w1) < 20:
+    """SMC + RSI: W1/D1 context, H4 trend filter, H1 liquidity sweep and structure shift."""
+    if len(h1) < 80 or len(h4) < 50 or len(d1) < 30 or len(w1) < 20:
         return None, "Недостатньо історичних даних на одному з таймфреймів"
 
-    # Yahoo may include the currently forming bar. Use completed bars for decisions.
+    # Exclude each currently forming candle from every decision.
     h1c, h4c, d1c, w1c = h1.iloc[:-1], h4.iloc[:-1], d1.iloc[:-1], w1.iloc[:-1]
     if min(len(h1c), len(h4c), len(d1c), len(w1c)) < 20:
         return None, "Недостатньо закритих свічок для аналізу"
 
-    last, prev = h1c.iloc[-1], h1c.iloc[-2]
-    op, cl = float(last.open), float(last.close)
-    hi, lo = float(last.high), float(last.low)
-    prev_hi, prev_lo, prev_close = float(prev.high), float(prev.low), float(prev.close)
-    candle_range = max(hi - lo, abs(cl) * 0.0003)
-    body = abs(cl - op)
-    # H1 confirmation: close direction plus either momentum through previous close
-    # or a meaningful candle body. This avoids requiring every indicator at once.
-    bullish = cl > op and (cl > prev_close or body >= candle_range * 0.45)
-    bearish = cl < op and (cl < prev_close or body >= candle_range * 0.45)
-    if not bullish and not bearish:
-        return None, "H1: остання закрита свічка не підтвердила напрямок"
-    side = "BUY" if bullish else "SELL"
-
-    # Initial signal does not require a breakout. After sending, the bot monitors return to its entry zone.
-
-    # Look for a reaction/zone on H1 or H4 in the last few closed candles,
-    # not only on the exact final candle. This reduces missed setups while keeping confirmation on H1.
-    def recent_setup_reasons(closed, label, bars=4):
-        out = []
-        if len(closed) < 25:
-            return out
-        recent = closed.tail(bars)
-        prior = closed.iloc[:-bars]
-        if len(prior) < 10:
-            return out
-        support = float(prior.tail(30).low.min())
-        resistance = float(prior.tail(30).high.max())
-        width = max(resistance - support, abs(float(closed.close.iloc[-1])) * 0.0005)
-        tol = max(abs(float(closed.close.iloc[-1])) * 0.0008, width * 0.06)
-        if side == "BUY" and (float(recent.low.min()) <= support + tol) and cl > op:
-            out.append(f"{label} SNR: тест/відбій підтримки")
-        if side == "SELL" and (float(recent.high.max()) >= resistance - tol) and cl < op:
-            out.append(f"{label} SNR: тест/відбій опору")
-        # Three-candle FVG zones; check recent candles for a revisit.
-        scan = closed.tail(35)
-        for i in range(max(2, len(scan) - 12), len(scan)):
-            left, mid, right = scan.iloc[i-2], scan.iloc[i-1], scan.iloc[i]
-            if side == "BUY":
-                gap_low, gap_high = float(left.high), float(right.low)
-                if gap_low < gap_high and float(recent.low.min()) <= gap_high and float(recent.high.max()) >= gap_low:
-                    out.append(f"{label} FVG: ціна тестувала bullish FVG")
-                    break
-            else:
-                gap_low, gap_high = float(right.high), float(left.low)
-                if gap_low < gap_high and float(recent.high.max()) >= gap_low and float(recent.low.min()) <= gap_high:
-                    out.append(f"{label} FVG: ціна тестувала bearish FVG")
-                    break
-        # RB proxy: recent strong reversal candle breaks prior candle extreme.
-        for i in range(max(1, len(recent)-3), len(recent)):
-            cur, before = recent.iloc[i], closed.iloc[-len(recent)+i-1]
-            if side == "BUY" and float(cur.close) > float(cur.open) and float(cur.close) > float(before.high):
-                out.append(f"{label} RB: бичачий злам локального максимуму")
-                break
-            if side == "SELL" and float(cur.close) < float(cur.open) and float(cur.close) < float(before.low):
-                out.append(f"{label} RB: ведмежий злам локального мінімуму")
-                break
-        return out
-
-    reasons = recent_setup_reasons(h1c, "H1") + recent_setup_reasons(h4c, "H4")
-    if not reasons:
-        return None, f"H1 підтвердив {side}, але за останні закриті свічки немає реакції SNR/RB/FVG на H1/H4"
+    setup, status = detect_smc_rsi(h1c)
+    if not setup:
+        return None, status
+    side = setup["side"]
 
     w_bias, d_bias, h4_bias = ema_bias(w1c), ema_bias(d1c), ema_bias(h4c)
     expected = "BULL" if side == "BUY" else "BEAR"
-    # D1 is a context filter, not an absolute blocker when neutral.
-    # Never trade directly against D1. If D1 is neutral, require H4 to agree with H1.
     if d_bias not in (expected, "NEUTRAL"):
-        return None, f"D1-фільтр: сигнал {side} відхилено, бо D1={d_bias}; напрямок протилежний"
+        return None, f"D1-фільтр: {side} відхилено, бо D1={d_bias}"
     if d_bias == "NEUTRAL" and h4_bias != expected:
-        return None, f"D1 нейтральний, а H4={h4_bias}; для сигналу {side} потрібне підтвердження H4={expected}"
+        return None, f"D1 нейтральний, а H4={h4_bias}; потрібне підтвердження H4={expected}"
+
     warnings = []
     if d_bias == "NEUTRAL":
-        warnings.append("D1 нейтральний; напрямок підтверджено H4 і H1")
+        warnings.append("D1 нейтральний; напрямок підтверджено H4")
     for tf, bias in (("W1", w_bias), ("H4", h4_bias)):
         if bias not in ("NEUTRAL", expected):
             warnings.append(f"УВАГА: {tf} проти сигналу ({bias})")
 
-    entry = cl
+    sig_i = setup["index"]
+    sig_candle = h1c.iloc[sig_i]
+    # Entry is current last closed H1 close so the bot doesn't send a stale historical entry.
+    last = h1c.iloc[-1]
+    entry = float(last.close)
     recent_h1 = h1c.tail(5)
+    candle_range = max(float(last.high) - float(last.low), abs(entry) * 0.0003)
     if side == "BUY":
         sl = float(recent_h1.low.min()) - candle_range * 0.15
         risk = entry - sl
@@ -374,8 +415,7 @@ def analyze(h1, h4, d1, w1):
             return None, "Не вдалося розрахувати стоп-лос"
         targets = [entry - risk, entry - 2 * risk]
 
-    reasons.insert(0, "H1: напрямок підтверджено закритою свічкою")
-    reasons.extend(warnings)
+    reasons = setup["reasons"] + [f"RSI H1: {setup['rsi']:.1f}", "Контекст: W1/D1/H4 фільтр"] + warnings
     return {
         "side": side, "entry": entry, "sl": sl, "tp": targets,
         "zone_low": entry - risk * 0.15, "zone_high": entry + risk * 0.15,
@@ -517,7 +557,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_subscribers()
     await update.effective_message.reply_text(
         f"Dmytro Gold Signals активний. Сканування кожні {INTERVAL} хв.\n"
-        "Логіка: D1 не має суперечити сигналу; якщо D1 нейтральний, потрібен збіг H4 і H1. SNR/RB/FVG + закрита H1-свічка.\n"
+        "Логіка: RSI 70/30 + sweep ліквідності + CHoCH/BOS + FVG/OB; фільтр D1/H4.\n"
         "M15 і Stochastic прибрані. Повторний сигнал по інструменту не надсилається, доки попередній не досягне SL або TP1. Автоматичних угод немає.\n"
         "Команди: /status /symbols /scan /help"
     )
@@ -526,7 +566,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Бот працює. Інтервал: {INTERVAL} хв. Підписників: {len(SUBSCRIBERS)}. Якщо після перезапуску число знову 0, потрібне постійне сховище Railway для subscribers.json.\n"
-        "D1 не має суперечити сигналу; якщо D1 нейтральний, потрібен збіг H4 і H1. H1-підтвердження; 2 тейки; повідомлення TP1/TP2/SL. M15 і Stochastic вимкнені; автоматичних угод немає. Yahoo Finance; XAU/XAG можуть перейти на ф’ючерсні проксі й відрізнятися від MT5."
+        "Стратегія SMC + RSI: RSI повертається з 70/30, sweep ліквідності, CHoCH/BOS та FVG/OB; D1/H4 фільтр; 2 тейки; повідомлення TP1/TP2/SL. Автоматичної торгівлі немає. Дані Yahoo Finance можуть відрізнятися від Vantage MT5."
     )
 
 
@@ -542,7 +582,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Сканую 9 інструментів. D1 не має суперечити сигналу; за нейтрального D1 потрібен збіг H4 і H1. Після сигналу відстежую повернення в зону; 2 тейки, повідомлення TP1/TP2/SL. M15 і Stochastic вимкнені.")
+    await update.effective_message.reply_text("Сканую 9 інструментів: RSI 70/30 + Smart Money (ліквідність, CHoCH/BOS, FVG/OB), фільтр D1/H4. Відстежую повернення в зону; 2 тейки, повідомлення TP1/TP2/SL.")
     await scan(context.application, update.effective_chat.id)
 
 
