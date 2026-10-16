@@ -1,4 +1,3 @@
-
-python-telegram-bot[job-queue]>=21.6,<23
-yfinance>=0.2.54
-pandas>=2.2
+python-telegram-bot[job-queue]
+pandas
+yfinance
