@@ -304,18 +304,34 @@ async def scan(app, report_chat_id=None):
                 diagnostics.append(f"{symbol}: цей сигнал уже надсилався для закритої H1-свічки")
                 continue
             delivered = False
-            for chat_id in list(SUBSCRIBERS):
+            send_errors = []
+            subscribers = list(SUBSCRIBERS)
+            if not subscribers:
+                diagnostics.append(f"{symbol}: сигнал знайдено, але немає підписників; надішли /start")
+                continue
+            message_text = make_message(symbol, signal)
+            for chat_id in subscribers:
                 try:
-                    await app.bot.send_message(chat_id=chat_id, text=make_message(symbol, signal), parse_mode="HTML")
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=message_text,
+                        parse_mode="HTML",
+                    )
                     delivered = True
                     sent += 1
-                except Exception:
-                    log.exception("Message send failed for chat %s", chat_id)
+                except Exception as exc:
+                    # Log the actual exception and surface a short actionable version
+                    # in /scan diagnostics instead of hiding the cause.
+                    log.exception("Telegram send failed for symbol=%s chat_id=%s", symbol, chat_id)
+                    detail = f"{type(exc).__name__}: {str(exc)}".replace("\n", " ")
+                    send_errors.append(detail[:220])
             if delivered:
                 ALERTED.add(key)
                 save_alerts()
+                if send_errors:
+                    diagnostics.append(f"{symbol}: доставлено не всім; помилки: {'; '.join(send_errors)}")
             else:
-                diagnostics.append(f"{symbol}: сигнал знайдено, але не доставлено; перевір /start і журнали Railway")
+                diagnostics.append(f"{symbol}: сигнал знайдено, але Telegram відхилив надсилання: {'; '.join(send_errors) or 'невідома помилка'}")
         except Exception:
             log.exception("Scan failed for %s", symbol)
             diagnostics.append(f"{symbol}: помилка; перевір Railway logs")
