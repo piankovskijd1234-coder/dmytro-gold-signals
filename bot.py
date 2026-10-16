@@ -12,16 +12,17 @@ TOKEN = "".join(os.getenv("TELEGRAM_BOT_TOKEN", "").split())
 INTERVAL = max(5, int(os.getenv("SCAN_INTERVAL_MINUTES", "5")))
 SUBSCRIBERS_FILE = "subscribers.json"
 ALERTS_FILE = "alerts.json"
+ACTIVE_FILE = "active_signals.json"
 SYMBOLS = {
     "BTC/USD": "BTC-USD",
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
     "EUR/JPY": "EURJPY=X",
     "AUD/USD": "AUDUSD=X",
-    "XAG/USD": "SI=F",  # Silver futures proxy; may differ from broker spot CFD
+    "XAG/USD": "XAGUSD=X",  # Yahoo spot-like quote; may still differ from broker CFD
     "EUR/AUD": "EURAUD=X",
     "USD/CHF": "CHF=X",
-    "XAU/USD": "GC=F",  # Gold futures proxy; may differ from broker spot CFD
+    "XAU/USD": "XAUUSD=X",  # Yahoo spot-like quote; may still differ from broker CFD
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -29,6 +30,7 @@ log = logging.getLogger("dmytro-gold-signals")
 SUBSCRIBERS = set()
 # Prevent duplicate alert for the same symbol, side and completed H1 candle.
 ALERTED = set()
+ACTIVE_SIGNALS = {}
 
 def load_alerts():
     global ALERTED
@@ -37,6 +39,7 @@ def load_alerts():
             ALERTED = set(json.load(f))
     except (OSError, ValueError, TypeError):
         ALERTED = set()
+ACTIVE_SIGNALS = {}
 
 def save_alerts():
     try:
@@ -62,6 +65,110 @@ def save_subscribers():
             json.dump(sorted(SUBSCRIBERS), f)
     except OSError:
         log.exception("Cannot save subscribers")
+
+
+
+def load_active_signals():
+    global ACTIVE_SIGNALS
+    try:
+        with open(ACTIVE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ACTIVE_SIGNALS = data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        ACTIVE_SIGNALS = {}
+
+
+def save_active_signals():
+    try:
+        with open(ACTIVE_FILE, "w", encoding="utf-8") as f:
+            json.dump(ACTIVE_SIGNALS, f, ensure_ascii=False)
+    except OSError:
+        log.exception("Cannot save active signal history")
+
+
+
+def check_active_signal(symbol, h1):
+    """Track original signal: return to entry zone, confirm original direction, TP1/TP2/SL or cancel."""
+
+    item = ACTIVE_SIGNALS.get(symbol)
+    if not item or h1.empty:
+        return None
+    try:
+        ts = pd.Timestamp(item.get("last_checked") or item.get("h1"))
+        ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    except Exception:
+        ts = h1.index[-2] if len(h1) > 1 else h1.index[-1]
+    closed = h1.iloc[:-1]
+    bars = closed[closed.index > ts]
+    if bars.empty:
+        return "активний сигнал; очікуємо повернення в зону входу або TP/SL"
+
+    events = []
+    side = item["side"]
+    entry, sl = float(item["entry"]), float(item["sl"])
+    tp1, tp2 = float(item["tp1"]), float(item["tp2"])
+    risk = abs(entry - sl)
+    zone_low = float(item.get("zone_low", entry - risk * 0.15))
+    zone_high = float(item.get("zone_high", entry + risk * 0.15))
+
+    for timestamp, candle in bars.iterrows():
+        high, low = float(candle.high), float(candle.low)
+        op, cl = float(candle.open), float(candle.close)
+        hit_sl = low <= sl if side == "BUY" else high >= sl
+        hit_tp1 = high >= tp1 if side == "BUY" else low <= tp1
+        hit_tp2 = high >= tp2 if side == "BUY" else low <= tp2
+
+        if hit_sl:
+            if not item.get("sl_notified"):
+                events.append(("SL", timestamp))
+            ACTIVE_SIGNALS.pop(symbol, None)
+            break
+        if hit_tp1 and not item.get("tp1_notified"):
+            events.append(("TP1", timestamp))
+            item["tp1_notified"] = True
+        if hit_tp2:
+            if not item.get("tp1_notified"):
+                events.append(("TP1", timestamp))
+                item["tp1_notified"] = True
+            if not item.get("tp2_notified"):
+                events.append(("TP2", timestamp))
+            ACTIVE_SIGNALS.pop(symbol, None)
+            break
+
+        touched_entry_zone = low <= zone_high and high >= zone_low
+        if touched_entry_zone and not item.get("entry_retest_notified"):
+            direction_close = cl > op if side == "BUY" else cl < op
+            closes_in_zone = zone_low <= cl <= zone_high
+            if direction_close and closes_in_zone:
+                events.append(("ENTRY_CONFIRMED", timestamp))
+                item["entry_retest_notified"] = True
+            elif (side == "BUY" and cl < zone_low - risk * 0.25) or (side == "SELL" and cl > zone_high + risk * 0.25):
+                events.append(("CANCELLED", timestamp))
+                ACTIVE_SIGNALS.pop(symbol, None)
+                break
+        item["last_checked"] = str(timestamp)
+
+    save_active_signals()
+    return events if events else "активний сигнал; чекаємо повернення в зону входу або TP/SL"
+
+
+async def notify_trade_events(app, symbol, item, events):
+    for event, timestamp in events:
+        if event == "TP1":
+            text = f"✅ TP1 досягнуто — {symbol} {item['side']}\nРівень: {fmt(symbol, float(item['tp1']))}\nСигнал активний, очікуємо TP2 або SL.\nH1: {timestamp}"
+        elif event == "TP2":
+            text = f"🎯 TP2 досягнуто — {symbol} {item['side']}\nРівень: {fmt(symbol, float(item['tp2']))}\nСигнал завершено.\nH1: {timestamp}"
+        elif event == "ENTRY_CONFIRMED":
+            text = f"✅ ПОЧАТКОВИЙ СИГНАЛ ПІДТВЕРДЖЕНО ПІСЛЯ ПОВЕРНЕННЯ В ЗОНУ — {symbol} {item['side']}\nЗона: {fmt(symbol, float(item.get('zone_low', item['entry'])))}–{fmt(symbol, float(item.get('zone_high', item['entry'])))}\nH1 закрилася в зоні в напрямку початкового сигналу {item['side']}.\nH1: {timestamp}"
+        elif event == "CANCELLED":
+            text = f"❌ ПОЧАТКОВИЙ СИГНАЛ СКАСОВАНО — {symbol} {item['side']}\nПісля повернення до зони H1 закрилася суттєво проти початкового напрямку.\nH1: {timestamp}"
+        else:
+            text = f"🛑 STOP LOSS — {symbol} {item['side']}\nРівень: {fmt(symbol, float(item['sl']))}\nСигнал завершено.\nH1: {timestamp}"
+        for chat_id in list(SUBSCRIBERS):
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=text)
+            except Exception:
+                log.exception("Could not send %s event for %s to chat %s", event, symbol, chat_id)
 
 
 def download(ticker, period, interval):
@@ -171,6 +278,8 @@ def analyze(h1, h4, d1, w1):
         return None, "H1: остання закрита свічка не підтвердила напрямок"
     side = "BUY" if bullish else "SELL"
 
+    # Initial signal does not require a breakout. After sending, the bot monitors return to its entry zone.
+
     # Look for a reaction/zone on H1 or H4 in the last few closed candles,
     # not only on the exact final candle. This reduces missed setups while keeping confirmation on H1.
     def recent_setup_reasons(closed, label, bars=4):
@@ -235,18 +344,19 @@ def analyze(h1, h4, d1, w1):
         risk = entry - sl
         if risk <= 0:
             return None, "Не вдалося розрахувати стоп-лос"
-        targets = [entry + risk, entry + 2 * risk, entry + 3 * risk]
+        targets = [entry + risk, entry + 2 * risk]
     else:
         sl = float(recent_h1.high.max()) + candle_range * 0.15
         risk = sl - entry
         if risk <= 0:
             return None, "Не вдалося розрахувати стоп-лос"
-        targets = [entry - risk, entry - 2 * risk, entry - 3 * risk]
+        targets = [entry - risk, entry - 2 * risk]
 
     reasons.insert(0, "H1: напрямок підтверджено закритою свічкою")
     reasons.extend(warnings)
     return {
         "side": side, "entry": entry, "sl": sl, "tp": targets,
+        "zone_low": entry - risk * 0.15, "zone_high": entry + risk * 0.15,
         "reasons": reasons,
         "context": f"W1={w_bias}, D1={d_bias}, H4={h4_bias}",
         "h1": str(h1c.index[-1]),
@@ -271,12 +381,11 @@ def make_message(symbol, signal):
         f"SL: {fmt(symbol, signal['sl'])}\n"
         f"TP1: {fmt(symbol, signal['tp'][0])}\n"
         f"TP2: {fmt(symbol, signal['tp'][1])}\n"
-        f"TP3: {fmt(symbol, signal['tp'][2])}\n\n"
         f"Причини:\n{reasons}\n"
         f"Контекст: {signal['context']}\n"
         f"Підтвердження: закрита свічка H1\n"
         f"Свічка H1: {signal['h1']}\n\n"
-        "⚠️ Не гарантія прибутку. Перевір котирування, спред і ризик. XAU/XAG використовують ф’ючерсні проксі Yahoo (GC=F/SI=F), ціна може відрізнятися від CFD брокера."
+        "⚠️ Не гарантія прибутку. Перевір котирування, спред і ризик. XAU/XAG беруться з Yahoo Finance (XAUUSD=X/XAGUSD=X); вони можуть відрізнятися від CFD брокера."
     )
 
 
@@ -291,6 +400,19 @@ async def scan(app, report_chat_id=None):
             if h1.empty or d1.empty or w1.empty:
                 diagnostics.append(f"{symbol}: Yahoo Finance не повернув достатньо даних")
                 continue
+            # Do not send another signal for a symbol while its previous signal is unresolved.
+            active_before = ACTIVE_SIGNALS.get(symbol)
+            active_note = check_active_signal(symbol, h1)
+            if isinstance(active_note, list) and active_before:
+                await notify_trade_events(app, symbol, active_before, active_note)
+                # Finish processing this symbol for this scan after any lifecycle event;
+                # don't instantly replace a just-completed/cancelled signal.
+                diagnostics.append(f"{symbol}: оброблено подію активного сигналу: {', '.join(e for e, _ in active_note)}")
+                continue
+            if symbol in ACTIVE_SIGNALS:
+                diagnostics.append(f"{symbol}: {active_note if isinstance(active_note, str) else 'активний сигнал; чекаємо TP2 або SL'}")
+                continue
+
             # Build H4 from H1 data; label buckets in UTC.
             h4 = h1.resample("4h", label="left", closed="left").agg({
                 "open": "first", "high": "max", "low": "min", "close": "last"
@@ -328,6 +450,22 @@ async def scan(app, report_chat_id=None):
             if delivered:
                 ALERTED.add(key)
                 save_alerts()
+                ACTIVE_SIGNALS[symbol] = {
+                    "side": signal["side"],
+                    "entry": float(signal["entry"]),
+                    "sl": float(signal["sl"]),
+                    "tp1": float(signal["tp"][0]),
+                    "tp2": float(signal["tp"][1]),
+                    "zone_low": float(signal.get("zone_low", signal["entry"])),
+                    "zone_high": float(signal.get("zone_high", signal["entry"])),
+                    "h1": signal["h1"],
+                    "last_checked": signal["h1"],
+                    "tp1_notified": False,
+                    "tp2_notified": False,
+                    "sl_notified": False,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                save_active_signals()
                 if send_errors:
                     diagnostics.append(f"{symbol}: доставлено не всім; помилки: {'; '.join(send_errors)}")
             else:
@@ -358,7 +496,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Dmytro Gold Signals активний. Сканування кожні {INTERVAL} хв.\n"
         "Логіка: обов’язковий напрямок D1 → H4/H1 SNR, RB або FVG → підтвердження закритою H1-свічкою.\n"
-        "M15 і Stochastic повністю прибрані. Автоматичні угоди не відкриваються.\n"
+        "M15 і Stochastic прибрані. Повторний сигнал по інструменту не надсилається, доки попередній не досягне SL або TP1. Автоматичних угод немає.\n"
         "Команди: /status /symbols /scan /help"
     )
 
@@ -366,7 +504,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Бот працює. Інтервал: {INTERVAL} хв. Підписників: {len(SUBSCRIBERS)}.\n"
-        "Обов’язковий напрямок D1 + підтвердження закритою H1-свічкою; M15 і Stochastic вимкнені; автоматичної торгівлі немає. Дані: Yahoo Finance; золото/срібло — ф’ючерсні проксі."
+        "Обов’язковий напрямок D1 + підтвердження закритою H1-свічкою; M15 і Stochastic вимкнені. Повторний сигнал блокується до TP2 або SL; повідомлення надсилаються на TP1, TP2 та SL. Автоматичної торгівлі немає. Дані: Yahoo Finance; золото/срібло — ф’ючерсні проксі."
     )
 
 
@@ -382,13 +520,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Сканую 9 інструментів. Напрямок D1 обов’язковий; підтвердження — закрита H1-свічка. M15 і Stochastic вимкнені.")
+    await update.effective_message.reply_text("Сканую 9 інструментів. Напрямок D1 обов’язковий; підтвердження — закрита H1-свічка. H1 має підтвердити пробій, повернення в зону та закриття; 2 тейки, повідомлення TP1/TP2/SL; M15 і Stochastic вимкнені.")
     await scan(context.application, update.effective_chat.id)
 
 
 async def post_init(app: Application):
     load_subscribers()
     load_alerts()
+    load_active_signals()
     if app.job_queue is None:
         raise RuntimeError("У requirements.txt має бути python-telegram-bot[job-queue]")
     app.job_queue.run_repeating(scheduled_scan, interval=INTERVAL * 60, first=15, name="market-scan")
