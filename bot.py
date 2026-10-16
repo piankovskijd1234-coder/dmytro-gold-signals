@@ -9,18 +9,19 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = "".join(os.getenv("TELEGRAM_BOT_TOKEN", "").split())
-INTERVAL = max(1, int(os.getenv("SCAN_INTERVAL_MINUTES", "5")))
+INTERVAL = max(5, int(os.getenv("SCAN_INTERVAL_MINUTES", "5")))
 SUBSCRIBERS_FILE = "subscribers.json"
+ALERTS_FILE = "alerts.json"
 SYMBOLS = {
     "BTC/USD": "BTC-USD",
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
     "EUR/JPY": "EURJPY=X",
     "AUD/USD": "AUDUSD=X",
-    "XAG/USD": "SI=F",
+    "XAG/USD": "SI=F",  # Silver futures proxy; may differ from broker spot CFD
     "EUR/AUD": "EURAUD=X",
     "USD/CHF": "CHF=X",
-    "XAU/USD": "GC=F",
+    "XAU/USD": "GC=F",  # Gold futures proxy; may differ from broker spot CFD
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -28,6 +29,22 @@ log = logging.getLogger("dmytro-gold-signals")
 SUBSCRIBERS = set()
 # Prevent duplicate alert for the same symbol, side and completed H1 candle.
 ALERTED = set()
+
+def load_alerts():
+    global ALERTED
+    try:
+        with open(ALERTS_FILE, "r", encoding="utf-8") as f:
+            ALERTED = set(json.load(f))
+    except (OSError, ValueError, TypeError):
+        ALERTED = set()
+
+def save_alerts():
+    try:
+        # Bound file size: keep the latest 2000 keys.
+        with open(ALERTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(ALERTED)[-2000:], f)
+    except OSError:
+        log.exception("Cannot save alert history")
 
 
 def load_subscribers():
@@ -134,62 +151,107 @@ def detect_setups(frame, label, lookback=30):
 
 
 def analyze(h1, h4, d1, w1):
-    """W1/D1 context; H4/H1 SNR-RB-FVG; H1 closed candle confirms. No M15 or Stochastic."""
-    if len(h1) < 40 or len(h4) < 40 or len(d1) < 30 or len(w1) < 20:
+    """W1/D1 context; H4/H1 SNR-RB-FVG; closed H1 candle confirms. No M15/Stochastic."""
+    if len(h1) < 40 or len(h4) < 30 or len(d1) < 30 or len(w1) < 20:
         return None, "Недостатньо історичних даних на одному з таймфреймів"
 
-    # Use only completed H1 candle for confirmation and prices.
-    h1_closed = h1.iloc[:-1]
-    if len(h1_closed) < 25:
-        return None, "Недостатньо закритих свічок H1"
-    last, prev = h1_closed.iloc[-1], h1_closed.iloc[-2]
+    # Yahoo may include the currently forming bar. Use completed bars for decisions.
+    h1c, h4c, d1c, w1c = h1.iloc[:-1], h4.iloc[:-1], d1.iloc[:-1], w1.iloc[:-1]
+    if min(len(h1c), len(h4c), len(d1c), len(w1c)) < 20:
+        return None, "Недостатньо закритих свічок для аналізу"
+
+    last, prev = h1c.iloc[-1], h1c.iloc[-2]
     op, cl = float(last.open), float(last.close)
-    prev_close = float(prev.close)
-    bullish = cl > op and cl > prev_close
-    bearish = cl < op and cl < prev_close
+    hi, lo = float(last.high), float(last.low)
+    prev_hi, prev_lo, prev_close = float(prev.high), float(prev.low), float(prev.close)
+    candle_range = max(hi - lo, abs(cl) * 0.0003)
+    body = abs(cl - op)
+    # H1 confirmation: close direction plus either momentum through previous close
+    # or a meaningful candle body. This avoids requiring every indicator at once.
+    bullish = cl > op and (cl > prev_close or body >= candle_range * 0.45)
+    bearish = cl < op and (cl < prev_close or body >= candle_range * 0.45)
     if not bullish and not bearish:
         return None, "H1: остання закрита свічка не підтвердила напрямок"
     side = "BUY" if bullish else "SELL"
 
-    setups_h1 = detect_setups(h1, "H1")
-    setups_h4 = detect_setups(h4, "H4")
-    # Do not require a reaction on every higher timeframe. Need at least one H1/H4 POI reaction.
-    reasons = setups_h1[side] + setups_h4[side]
-    if not reasons:
-        return None, f"H1 підтвердив {side}, але немає реакції SNR/RB/FVG на H1/H4"
+    # Look for a reaction/zone on H1 or H4 in the last few closed candles,
+    # not only on the exact final candle. This reduces missed setups while keeping confirmation on H1.
+    def recent_setup_reasons(frame, label, bars=4):
+        out = []
+        if len(frame) < 25:
+            return out
+        closed = frame.iloc[:-1]
+        recent = closed.tail(bars)
+        prior = closed.iloc[:-bars]
+        if len(prior) < 10:
+            return out
+        support = float(prior.tail(30).low.min())
+        resistance = float(prior.tail(30).high.max())
+        width = max(resistance - support, abs(float(closed.close.iloc[-1])) * 0.0005)
+        tol = max(abs(float(closed.close.iloc[-1])) * 0.0008, width * 0.06)
+        if side == "BUY" and (float(recent.low.min()) <= support + tol) and cl > op:
+            out.append(f"{label} SNR: тест/відбій підтримки")
+        if side == "SELL" and (float(recent.high.max()) >= resistance - tol) and cl < op:
+            out.append(f"{label} SNR: тест/відбій опору")
+        # Three-candle FVG zones; check recent candles for a revisit.
+        scan = closed.tail(35)
+        for i in range(max(2, len(scan) - 12), len(scan)):
+            left, mid, right = scan.iloc[i-2], scan.iloc[i-1], scan.iloc[i]
+            if side == "BUY":
+                gap_low, gap_high = float(left.high), float(right.low)
+                if gap_low < gap_high and float(recent.low.min()) <= gap_high and float(recent.high.max()) >= gap_low:
+                    out.append(f"{label} FVG: ціна тестувала bullish FVG")
+                    break
+            else:
+                gap_low, gap_high = float(right.high), float(left.low)
+                if gap_low < gap_high and float(recent.high.max()) >= gap_low and float(recent.low.min()) <= gap_high:
+                    out.append(f"{label} FVG: ціна тестувала bearish FVG")
+                    break
+        # RB proxy: recent strong reversal candle breaks prior candle extreme.
+        for i in range(max(1, len(recent)-3), len(recent)):
+            cur, before = recent.iloc[i], closed.iloc[-len(recent)+i-1]
+            if side == "BUY" and float(cur.close) > float(cur.open) and float(cur.close) > float(before.high):
+                out.append(f"{label} RB: бичачий злам локального максимуму")
+                break
+            if side == "SELL" and float(cur.close) < float(cur.open) and float(cur.close) < float(before.low):
+                out.append(f"{label} RB: ведмежий злам локального мінімуму")
+                break
+        return out
 
-    w_bias, d_bias, h4_bias = ema_bias(w1), ema_bias(d1), ema_bias(h4)
-    # Higher-timeframe disagreement is reported, not used as a hard blocker.
+    reasons = recent_setup_reasons(h1, "H1") + recent_setup_reasons(h4, "H4")
+    if not reasons:
+        return None, f"H1 підтвердив {side}, але за останні свічки немає підтвердженої реакції SNR/RB/FVG на H1/H4"
+
+    w_bias, d_bias, h4_bias = ema_bias(w1c), ema_bias(d1c), ema_bias(h4c)
     warnings = []
+    expected = "BULL" if side == "BUY" else "BEAR"
     for tf, bias in (("W1", w_bias), ("D1", d_bias), ("H4", h4_bias)):
-        if bias not in ("NEUTRAL", ("BULL" if side == "BUY" else "BEAR")):
-            warnings.append(f"{tf} проти сигналу ({bias})")
-    reasons.insert(0, "H1: напрямок підтверджено закритою свічкою")
-    reasons.extend(warnings)
+        if bias not in ("NEUTRAL", expected):
+            warnings.append(f"УВАГА: {tf} проти сигналу ({bias})")
 
     entry = cl
-    recent = h1_closed.tail(5)
-    candle_range = max(float(last.high) - float(last.low), abs(entry) * 0.0005)
+    recent_h1 = h1c.tail(5)
     if side == "BUY":
-        sl = float(recent.low.min()) - candle_range * 0.15
+        sl = float(recent_h1.low.min()) - candle_range * 0.15
         risk = entry - sl
         if risk <= 0:
             return None, "Не вдалося розрахувати стоп-лос"
         targets = [entry + risk, entry + 2 * risk, entry + 3 * risk]
     else:
-        sl = float(recent.high.max()) + candle_range * 0.15
+        sl = float(recent_h1.high.max()) + candle_range * 0.15
         risk = sl - entry
         if risk <= 0:
             return None, "Не вдалося розрахувати стоп-лос"
         targets = [entry - risk, entry - 2 * risk, entry - 3 * risk]
 
+    reasons.insert(0, "H1: напрямок підтверджено закритою свічкою")
+    reasons.extend(warnings)
     return {
         "side": side, "entry": entry, "sl": sl, "tp": targets,
         "reasons": reasons,
         "context": f"W1={w_bias}, D1={d_bias}, H4={h4_bias}",
-        "h1": str(h1_closed.index[-1]),
+        "h1": str(h1c.index[-1]),
     }, "Signal"
-
 
 def fmt(symbol, value):
     if symbol == "BTC/USD":
@@ -215,7 +277,7 @@ def make_message(symbol, signal):
         f"Контекст: {signal['context']}\n"
         f"Підтвердження: закрита свічка H1\n"
         f"Свічка H1: {signal['h1']}\n\n"
-        "⚠️ Це торговий сигнал, не гарантія прибутку. Перевір котирування, спред і ризик."
+        "⚠️ Не гарантія прибутку. Перевір котирування, спред і ризик. XAU/XAG використовують ф’ючерсні проксі Yahoo (GC=F/SI=F), ціна може відрізнятися від CFD брокера."
     )
 
 
@@ -242,7 +304,6 @@ async def scan(app, report_chat_id=None):
             if key in ALERTED:
                 diagnostics.append(f"{symbol}: цей сигнал уже надсилався для закритої H1-свічки")
                 continue
-            ALERTED.add(key)
             delivered = False
             for chat_id in list(SUBSCRIBERS):
                 try:
@@ -251,8 +312,11 @@ async def scan(app, report_chat_id=None):
                     sent += 1
                 except Exception:
                     log.exception("Message send failed for chat %s", chat_id)
-            if not delivered:
-                diagnostics.append(f"{symbol}: сигнал знайдено, але немає активних підписників (/start)")
+            if delivered:
+                ALERTED.add(key)
+                save_alerts()
+            else:
+                diagnostics.append(f"{symbol}: сигнал знайдено, але не доставлено; перевір /start і журнали Railway")
         except Exception:
             log.exception("Scan failed for %s", symbol)
             diagnostics.append(f"{symbol}: помилка; перевір Railway logs")
@@ -287,7 +351,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Бот працює. Інтервал: {INTERVAL} хв. Підписників: {len(SUBSCRIBERS)}.\n"
-        "H1-підтвердження; M15 і Stochastic вимкнені; автоматичної торгівлі немає."
+        "H1-підтвердження; M15 і Stochastic вимкнені; автоматичної торгівлі немає. Дані: Yahoo Finance; золото/срібло — ф’ючерсні проксі."
     )
 
 
@@ -303,12 +367,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Сканую 9 інструментів за H1-підтвердженням; M15 і Stochastic не використовуються.")
+    await update.effective_message.reply_text("Сканую 9 інструментів. Підтвердження — закрита H1-свічка; M15 і Stochastic не використовуються.")
     await scan(context.application, update.effective_chat.id)
 
 
 async def post_init(app: Application):
     load_subscribers()
+    load_alerts()
     if app.job_queue is None:
         raise RuntimeError("У requirements.txt має бути python-telegram-bot[job-queue]")
     app.job_queue.run_repeating(scheduled_scan, interval=INTERVAL * 60, first=15, name="market-scan")
