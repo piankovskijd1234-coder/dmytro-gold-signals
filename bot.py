@@ -90,13 +90,10 @@ def download(ticker, period, interval):
 
 
 def ema_bias(frame):
-    """Simple trend context. Neutral is allowed; it does not automatically block H1 setups."""
-    if frame.empty or len(frame) < 55:
+    """Trend context from already-closed candles only."""
+    if frame.empty or len(frame) < 50:
         return "NEUTRAL"
-    closed = frame.iloc[:-1]
-    if len(closed) < 50:
-        return "NEUTRAL"
-    close = closed["close"]
+    close = frame["close"]
     e20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
     e50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
     price = float(close.iloc[-1])
@@ -176,11 +173,10 @@ def analyze(h1, h4, d1, w1):
 
     # Look for a reaction/zone on H1 or H4 in the last few closed candles,
     # not only on the exact final candle. This reduces missed setups while keeping confirmation on H1.
-    def recent_setup_reasons(frame, label, bars=4):
+    def recent_setup_reasons(closed, label, bars=4):
         out = []
-        if len(frame) < 25:
+        if len(closed) < 25:
             return out
-        closed = frame.iloc[:-1]
         recent = closed.tail(bars)
         prior = closed.iloc[:-bars]
         if len(prior) < 10:
@@ -218,14 +214,17 @@ def analyze(h1, h4, d1, w1):
                 break
         return out
 
-    reasons = recent_setup_reasons(h1, "H1") + recent_setup_reasons(h4, "H4")
+    reasons = recent_setup_reasons(h1c, "H1") + recent_setup_reasons(h4c, "H4")
     if not reasons:
-        return None, f"H1 підтвердив {side}, але за останні свічки немає підтвердженої реакції SNR/RB/FVG на H1/H4"
+        return None, f"H1 підтвердив {side}, але за останні закриті свічки немає реакції SNR/RB/FVG на H1/H4"
 
     w_bias, d_bias, h4_bias = ema_bias(w1c), ema_bias(d1c), ema_bias(h4c)
-    warnings = []
     expected = "BULL" if side == "BUY" else "BEAR"
-    for tf, bias in (("W1", w_bias), ("D1", d_bias), ("H4", h4_bias)):
+    # Strict daily direction filter: no signal against D1, and no signal if D1 is neutral.
+    if d_bias != expected:
+        return None, f"D1-фільтр: сигнал {side} відхилено, бо D1={d_bias}; потрібен D1={expected}"
+    warnings = []
+    for tf, bias in (("W1", w_bias), ("H4", h4_bias)):
         if bias not in ("NEUTRAL", expected):
             warnings.append(f"УВАГА: {tf} проти сигналу ({bias})")
 
@@ -342,7 +341,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_subscribers()
     await update.effective_message.reply_text(
         f"Dmytro Gold Signals активний. Сканування кожні {INTERVAL} хв.\n"
-        "Логіка: W1/D1 контекст → H4/H1 SNR, RB, FVG → підтвердження закритою H1-свічкою.\n"
+        "Логіка: обов’язковий напрямок D1 → H4/H1 SNR, RB або FVG → підтвердження закритою H1-свічкою.\n"
         "M15 і Stochastic повністю прибрані. Автоматичні угоди не відкриваються.\n"
         "Команди: /status /symbols /scan /help"
     )
@@ -351,7 +350,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Бот працює. Інтервал: {INTERVAL} хв. Підписників: {len(SUBSCRIBERS)}.\n"
-        "H1-підтвердження; M15 і Stochastic вимкнені; автоматичної торгівлі немає. Дані: Yahoo Finance; золото/срібло — ф’ючерсні проксі."
+        "Обов’язковий напрямок D1 + підтвердження закритою H1-свічкою; M15 і Stochastic вимкнені; автоматичної торгівлі немає. Дані: Yahoo Finance; золото/срібло — ф’ючерсні проксі."
     )
 
 
@@ -367,7 +366,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Сканую 9 інструментів. Підтвердження — закрита H1-свічка; M15 і Stochastic не використовуються.")
+    await update.effective_message.reply_text("Сканую 9 інструментів. Напрямок D1 обов’язковий; підтвердження — закрита H1-свічка. M15 і Stochastic вимкнені.")
     await scan(context.application, update.effective_chat.id)
 
 
