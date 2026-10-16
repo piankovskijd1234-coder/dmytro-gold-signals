@@ -1,31 +1,41 @@
 import os
 import json
 import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from datetime import datetime, timezone
+
 import pandas as pd
 import yfinance as yf
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = "".join(os.getenv("TELEGRAM_BOT_TOKEN", "").split())
 INTERVAL = max(1, int(os.getenv("SCAN_INTERVAL_MINUTES", "5")))
 SUBSCRIBERS_FILE = "subscribers.json"
 SYMBOLS = {
-    "BTC/USD": "BTC-USD", "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X",
-    "EUR/JPY": "EURJPY=X", "AUD/USD": "AUDUSD=X", "XAG/USD": "SI=F",
-    "EUR/AUD": "EURAUD=X", "USD/CHF": "CHF=X", "XAU/USD": "GC=F",
+    "BTC/USD": "BTC-USD",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "EUR/JPY": "EURJPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "XAG/USD": "SI=F",
+    "EUR/AUD": "EURAUD=X",
+    "USD/CHF": "CHF=X",
+    "XAU/USD": "GC=F",
 }
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("dmytro-gold-signals")
 SUBSCRIBERS = set()
+# Prevent duplicate alert for the same symbol, side and completed H1 candle.
 ALERTED = set()
 
 
 def load_subscribers():
     global SUBSCRIBERS
     try:
-        with open(SUBSCRIBERS_FILE, encoding="utf-8") as f:
+        with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
             SUBSCRIBERS = {int(x) for x in json.load(f)}
-    except Exception:
+    except (OSError, ValueError, TypeError):
         SUBSCRIBERS = set()
 
 
@@ -33,261 +43,275 @@ def save_subscribers():
     try:
         with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
             json.dump(sorted(SUBSCRIBERS), f)
-    except Exception:
+    except OSError:
         log.exception("Cannot save subscribers")
 
 
 def download(ticker, period, interval):
     try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False, threads=False)
-        if df is None or df.empty:
+        frame = yf.download(
+            ticker, period=period, interval=interval,
+            progress=False, threads=False, auto_adjust=False,
+        )
+        if frame is None or frame.empty:
             return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
-        return df[["open", "high", "low", "close"]].dropna()
+        if isinstance(frame.columns, pd.MultiIndex):
+            frame.columns = frame.columns.get_level_values(0)
+        frame.columns = [str(c).lower().replace(" ", "_") for c in frame.columns]
+        required = ["open", "high", "low", "close"]
+        if not all(c in frame.columns for c in required):
+            return pd.DataFrame()
+        frame = frame[required].apply(pd.to_numeric, errors="coerce").dropna()
+        if frame.index.tz is None:
+            frame.index = frame.index.tz_localize("UTC")
+        else:
+            frame.index = frame.index.tz_convert("UTC")
+        return frame.sort_index()
     except Exception:
         log.exception("Quote download failed: %s %s", ticker, interval)
         return pd.DataFrame()
 
 
-def trend(df):
-    if len(df) < 205:
+def ema_bias(frame):
+    """Simple trend context. Neutral is allowed; it does not automatically block H1 setups."""
+    if frame.empty or len(frame) < 55:
         return "NEUTRAL"
-    c = df["close"]
-    e50, e100, e200 = [float(c.ewm(span=n, adjust=False).mean().iloc[-1]) for n in (50, 100, 200)]
-    p = float(c.iloc[-1])
-    if p > e50 > e100 > e200:
+    closed = frame.iloc[:-1]
+    if len(closed) < 50:
+        return "NEUTRAL"
+    close = closed["close"]
+    e20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+    e50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+    price = float(close.iloc[-1])
+    if price > e20 > e50:
         return "BULL"
-    if p < e50 < e100 < e200:
+    if price < e20 < e50:
         return "BEAR"
     return "NEUTRAL"
 
 
-
-def snr(df, n=30):
-    d = df.iloc[:-1].tail(n)
-    if len(d) < 10:
-        return None, None
-    return float(d.low.min()), float(d.high.max())
-
-
-def fvg(df):
-    d = df.iloc[:-1]
-    for i in range(len(d)-1, max(1, len(d)-40), -1):
-        left, right = d.iloc[i-2], d.iloc[i]
-        if float(left.high) < float(right.low):
-            return ("BULL", float(left.high), float(right.low))
-        if float(left.low) > float(right.high):
-            return ("BEAR", float(right.high), float(left.low))
-    return None
-
-
-def timeframe_setups(frame, label):
-    """Detect approximate SNR, FVG and RB-style reactions on a completed candle."""
-    out = {"BUY": [], "SELL": []}
+def detect_setups(frame, label, lookback=30):
+    """Return SNR/FVG/RB reactions on completed candles only."""
+    result = {"BUY": [], "SELL": []}
     if frame.empty or len(frame) < 25:
-        return out
-    data = frame.iloc[:-1]  # don't use the candle still forming
-    if len(data) < 20:
-        return out
-    cur, prev = data.iloc[-1], data.iloc[-2]
+        return result
+    closed = frame.iloc[:-1]
+    if len(closed) < 22:
+        return result
+    cur, prev = closed.iloc[-1], closed.iloc[-2]
     op, cl, hi, lo = map(float, (cur.open, cur.close, cur.high, cur.low))
     pop, pcl, phi, plo = map(float, (prev.open, prev.close, prev.high, prev.low))
 
-    # SNR zone: approximate recent support/resistance from the prior 20 completed bars.
-    lookback = data.iloc[-21:-1]
-    if len(lookback) >= 10:
-        support = float(lookback.low.min())
-        resistance = float(lookback.high.max())
-        if lo <= support * 1.002 and cl > op and cl > support:
-            out["BUY"].append(f"{label} SNR: bullish reaction near support")
-        if hi >= resistance * 0.998 and cl < op and cl < resistance:
-            out["SELL"].append(f"{label} SNR: bearish reaction near resistance")
+    # Support/resistance reaction: current completed candle reacts at a prior range edge.
+    prior = closed.iloc[-(lookback + 1):-1]
+    if len(prior) >= 10:
+        support = float(prior.low.min())
+        resistance = float(prior.high.max())
+        tolerance = max(abs(cl) * 0.001, (resistance - support) * 0.04)
+        if lo <= support + tolerance and cl > op and cl > support:
+            result["BUY"].append(f"{label} SNR: відбій від підтримки")
+        if hi >= resistance - tolerance and cl < op and cl < resistance:
+            result["SELL"].append(f"{label} SNR: відбій від опору")
 
-    # FVG: most recent three-candle imbalance and current price reaction into it.
-    gap = None
-    for i in range(len(data)-1, max(1, len(data)-40), -1):
-        left, right = data.iloc[i-2], data.iloc[i]
-        if float(left.high) < float(right.low):
-            gap = ("BUY", float(left.high), float(right.low))
+    # Fair Value Gap (three-candle imbalance) with a reaction on the latest closed candle.
+    for i in range(len(closed) - 1, max(2, len(closed) - 35), -1):
+        left, right = closed.iloc[i - 2], closed.iloc[i]
+        left_high, left_low = float(left.high), float(left.low)
+        right_high, right_low = float(right.high), float(right.low)
+        if left_high < right_low and lo <= right_low and cl > op and cl >= left_high:
+            result["BUY"].append(f"{label} FVG: реакція в bullish FVG")
             break
-        if float(left.low) > float(right.high):
-            gap = ("SELL", float(right.high), float(left.low))
+        if left_low > right_high and hi >= right_high and cl < op and cl <= left_low:
+            result["SELL"].append(f"{label} FVG: реакція в bearish FVG")
             break
-    if gap:
-        if gap[0] == "BUY" and lo <= gap[2] and cl > op and cl >= gap[1]:
-            out["BUY"].append(f"{label} FVG: bullish gap reaction")
-        if gap[0] == "SELL" and hi >= gap[1] and cl < op and cl <= gap[2]:
-            out["SELL"].append(f"{label} FVG: bearish gap reaction")
 
-    # RB is a heuristic reversal-block proxy based on a reversal candle taking prior high/low.
+    # RB proxy: reversal candle closes beyond the previous candle's extreme.
     if pcl < pop and cl > op and cl > phi:
-        out["BUY"].append(f"{label} RB: bullish reversal pattern")
+        result["BUY"].append(f"{label} RB: бичаче поглинання/злам локального максимуму")
     if pcl > pop and cl < op and cl < plo:
-        out["SELL"].append(f"{label} RB: bearish reversal pattern")
-    return out
+        result["SELL"].append(f"{label} RB: ведмеже поглинання/злам локального мінімуму")
+    return result
 
 
 def analyze(h1, h4, d1, w1):
-    """W1/D1 context, H4 direction, H1 setup and H1 candle confirmation. No Stochastic/M15."""
-    if min(len(h4), len(d1), len(w1)) < 205 or len(h1) < 35:
-        return None, "Недостатньо історичних даних для W1/D1/H4/H1"
+    """W1/D1 context; H4/H1 SNR-RB-FVG; H1 closed candle confirms. No M15 or Stochastic."""
+    if len(h1) < 40 or len(h4) < 40 or len(d1) < 30 or len(w1) < 20:
+        return None, "Недостатньо історичних даних на одному з таймфреймів"
 
-    all_tf = {
-        "W1": timeframe_setups(w1, "W1"),
-        "D1": timeframe_setups(d1, "D1"),
-        "H4": timeframe_setups(h4, "H4"),
-        "H1": timeframe_setups(h1, "H1"),
-    }
-    tw, td, th = trend(w1), trend(d1), trend(h4)
-    if th == "NEUTRAL" and len(h4) >= 55:
-        h4close = float(h4["close"].iloc[-2])
-        h4ema50 = float(h4["close"].ewm(span=50, adjust=False).mean().iloc[-2])
-        if h4close > h4ema50:
-            th = "BULL"
-        elif h4close < h4ema50:
-            th = "BEAR"
-    if th == "NEUTRAL":
-        return None, f"H4 нейтральний; W1={tw}, D1={td}, H4={th}; SNR/RB/FVG перевірено"
-
-    side = "BUY" if th == "BULL" else "SELL"
-    reasons = []
-    for tf in ("W1", "D1", "H4", "H1"):
-        reasons.extend(all_tf[tf][side])
-    if not reasons:
-        return None, f"{side}: немає реакції SNR/RB/FVG на W1/D1/H4/H1"
-
-    # H1 confirmation uses the latest COMPLETED H1 candle, never the live candle.
-    h = h1.iloc[:-1]
-    if len(h) < 6:
+    # Use only completed H1 candle for confirmation and prices.
+    h1_closed = h1.iloc[:-1]
+    if len(h1_closed) < 25:
         return None, "Недостатньо закритих свічок H1"
-    cur, prev = h.iloc[-1], h.iloc[-2]
-    op, cl, prev_close = float(cur.open), float(cur.close), float(prev.close)
-    h1_setups = all_tf["H1"][side]
-    if side == "BUY":
-        candle_confirm = cl > op and cl > prev_close
-    else:
-        candle_confirm = cl < op and cl < prev_close
+    last, prev = h1_closed.iloc[-1], h1_closed.iloc[-2]
+    op, cl = float(last.open), float(last.close)
+    prev_close = float(prev.close)
+    bullish = cl > op and cl > prev_close
+    bearish = cl < op and cl < prev_close
+    if not bullish and not bearish:
+        return None, "H1: остання закрита свічка не підтвердила напрямок"
+    side = "BUY" if bullish else "SELL"
 
-    if not candle_confirm and not h1_setups:
-        return None, f"{side}: є зона, але H1 ще не підтвердив напрямок закритою свічкою або реакцією SNR/RB/FVG"
-    if candle_confirm:
-        reasons.append("H1: підтвердження закритою свічкою в напрямку сигналу")
-    if h1_setups:
-        reasons.extend(h1_setups)
+    setups_h1 = detect_setups(h1, "H1")
+    setups_h4 = detect_setups(h4, "H4")
+    # Do not require a reaction on every higher timeframe. Need at least one H1/H4 POI reaction.
+    reasons = setups_h1[side] + setups_h4[side]
+    if not reasons:
+        return None, f"H1 підтвердив {side}, але немає реакції SNR/RB/FVG на H1/H4"
+
+    w_bias, d_bias, h4_bias = ema_bias(w1), ema_bias(d1), ema_bias(h4)
+    # Higher-timeframe disagreement is reported, not used as a hard blocker.
+    warnings = []
+    for tf, bias in (("W1", w_bias), ("D1", d_bias), ("H4", h4_bias)):
+        if bias not in ("NEUTRAL", ("BULL" if side == "BUY" else "BEAR")):
+            warnings.append(f"{tf} проти сигналу ({bias})")
+    reasons.insert(0, "H1: напрямок підтверджено закритою свічкою")
+    reasons.extend(warnings)
 
     entry = cl
-    h1_high, h1_low = float(h.iloc[-1].high), float(h.iloc[-1].low)
+    recent = h1_closed.tail(5)
+    candle_range = max(float(last.high) - float(last.low), abs(entry) * 0.0005)
     if side == "BUY":
-        structure = min(h1_low, float(h.tail(5).low.min()))
-        sl = structure - max(abs(entry) * 0.001, abs(h1_high-h1_low) * 0.25)
+        sl = float(recent.low.min()) - candle_range * 0.15
         risk = entry - sl
         if risk <= 0:
-            return None, "Не вдалося коректно розрахувати SL"
-        targets = [entry+risk, entry+2*risk, entry+3*risk]
+            return None, "Не вдалося розрахувати стоп-лос"
+        targets = [entry + risk, entry + 2 * risk, entry + 3 * risk]
     else:
-        structure = max(h1_high, float(h.tail(5).high.max()))
-        sl = structure + max(abs(entry) * 0.001, abs(h1_high-h1_low) * 0.25)
+        sl = float(recent.high.max()) + candle_range * 0.15
         risk = sl - entry
         if risk <= 0:
-            return None, "Не вдалося коректно розрахувати SL"
-        targets = [entry-risk, entry-2*risk, entry-3*risk]
+            return None, "Не вдалося розрахувати стоп-лос"
+        targets = [entry - risk, entry - 2 * risk, entry - 3 * risk]
 
     return {
         "side": side, "entry": entry, "sl": sl, "tp": targets,
-        "reasons": reasons, "context": f"W1={tw}, D1={td}, H4={th}",
-        "h1": str(h.index[-1]),
+        "reasons": reasons,
+        "context": f"W1={w_bias}, D1={d_bias}, H4={h4_bias}",
+        "h1": str(h1_closed.index[-1]),
     }, "Signal"
 
-def fmt(sym, x):
-    if sym == "BTC/USD": return f"{x:,.2f}"
-    if sym in ("XAU/USD","XAG/USD"): return f"{x:,.3f}"
-    if "JPY" in sym: return f"{x:.3f}"
-    return f"{x:.5f}" if abs(x)<10 else f"{x:.4f}"
+
+def fmt(symbol, value):
+    if symbol == "BTC/USD":
+        return f"{value:,.2f}"
+    if symbol in ("XAU/USD", "XAG/USD"):
+        return f"{value:,.3f}"
+    if "JPY" in symbol:
+        return f"{value:.3f}"
+    return f"{value:.5f}" if abs(value) < 10 else f"{value:.4f}"
 
 
-def message(sym, s):
-    icon = "🟢" if s["side"] == "BUY" else "🔴"
-    why = "\n".join("• "+r for r in s["reasons"])
-    return (f"{icon} <b>{s['side']} — {sym}</b>\n"
-            f"Entry H1: {fmt(sym,s['entry'])}\nSL: {fmt(sym,s['sl'])}\n"
-            f"TP1: {fmt(sym,s['tp'][0])}\nTP2: {fmt(sym,s['tp'][1])}\nTP3: {fmt(sym,s['tp'][2])}\n\n"
-            f"Причини:\n{why}\nКонтекст: {s['context']}\nПідтвердження: H1 закрита свічка\nH1: {s['h1']}\n"
-            "⚠️ Сигнал не гарантує прибутку; перевір спред і ризик.")
+def make_message(symbol, signal):
+    icon = "🟢" if signal["side"] == "BUY" else "🔴"
+    reasons = "\n".join("• " + r for r in signal["reasons"])
+    return (
+        f"{icon} <b>{signal['side']} — {symbol}</b>\n"
+        f"Entry (H1): {fmt(symbol, signal['entry'])}\n"
+        f"SL: {fmt(symbol, signal['sl'])}\n"
+        f"TP1: {fmt(symbol, signal['tp'][0])}\n"
+        f"TP2: {fmt(symbol, signal['tp'][1])}\n"
+        f"TP3: {fmt(symbol, signal['tp'][2])}\n\n"
+        f"Причини:\n{reasons}\n"
+        f"Контекст: {signal['context']}\n"
+        f"Підтвердження: закрита свічка H1\n"
+        f"Свічка H1: {signal['h1']}\n\n"
+        "⚠️ Це торговий сигнал, не гарантія прибутку. Перевір котирування, спред і ризик."
+    )
 
 
-async def scan(app, report_id=None):
-    sent, diagnostics = 0, []
-    for sym, ticker in SYMBOLS.items():
+async def scan(app, report_chat_id=None):
+    sent = 0
+    diagnostics = []
+    for symbol, ticker in SYMBOLS.items():
         try:
             h1 = download(ticker, "60d", "1h")
             d1 = download(ticker, "2y", "1d")
             w1 = download(ticker, "5y", "1wk")
-            if any(x.empty for x in (h1,d1,w1)):
-                diagnostics.append(f"{sym}: немає даних від Yahoo Finance")
+            if h1.empty or d1.empty or w1.empty:
+                diagnostics.append(f"{symbol}: Yahoo Finance не повернув достатньо даних")
                 continue
-            h4 = h1.resample("4h").agg({"open":"first","high":"max","low":"min","close":"last"}).dropna()
-            setup, reason = analyze(h1,h4,d1,w1)
-            if not setup:
-                diagnostics.append(f"{sym}: {reason}")
+            # Build H4 from H1 data; label buckets in UTC.
+            h4 = h1.resample("4h", label="left", closed="left").agg({
+                "open": "first", "high": "max", "low": "min", "close": "last"
+            }).dropna()
+            signal, reason = analyze(h1, h4, d1, w1)
+            if not signal:
+                diagnostics.append(f"{symbol}: {reason}")
                 continue
-            key = f"{sym}|{setup['side']}|{setup['h1']}"
+            key = f"{symbol}|{signal['side']}|{signal['h1']}"
             if key in ALERTED:
-                diagnostics.append(f"{sym}: сигнал для цієї свічки вже надсилався")
+                diagnostics.append(f"{symbol}: цей сигнал уже надсилався для закритої H1-свічки")
                 continue
             ALERTED.add(key)
-            for chat in list(SUBSCRIBERS):
+            delivered = False
+            for chat_id in list(SUBSCRIBERS):
                 try:
-                    await app.bot.send_message(chat_id=chat,text=message(sym,setup),parse_mode="HTML")
+                    await app.bot.send_message(chat_id=chat_id, text=make_message(symbol, signal), parse_mode="HTML")
+                    delivered = True
                     sent += 1
                 except Exception:
-                    log.exception("Message send failed")
+                    log.exception("Message send failed for chat %s", chat_id)
+            if not delivered:
+                diagnostics.append(f"{symbol}: сигнал знайдено, але немає активних підписників (/start)")
         except Exception:
-            log.exception("Scan failed for %s", sym)
-            diagnostics.append(f"{sym}: помилка сканування; дивись Railway logs")
-    if report_id is not None:
-        await app.bot.send_message(chat_id=report_id,text=f"Сканування завершено. Надіслано сигналів: {sent}\n\nДіагностика:\n"+"\n".join("• "+x for x in diagnostics))
+            log.exception("Scan failed for %s", symbol)
+            diagnostics.append(f"{symbol}: помилка; перевір Railway logs")
+    if report_chat_id is not None:
+        # Telegram messages have a 4096 character limit; split diagnostic output safely.
+        header = f"Сканування завершено. Надіслано повідомлень із сигналами: {sent}\n\nДіагностика:\n"
+        chunk = header
+        for line in diagnostics:
+            addition = "• " + line + "\n"
+            if len(chunk) + len(addition) > 3800:
+                await app.bot.send_message(chat_id=report_chat_id, text=chunk)
+                chunk = "Діагностика (продовження):\n"
+            chunk += addition
+        await app.bot.send_message(chat_id=report_chat_id, text=chunk)
 
 
-async def job(ctx: ContextTypes.DEFAULT_TYPE):
-    await scan(ctx.application)
+async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
+    await scan(context.application)
 
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUBSCRIBERS.add(update.effective_chat.id)
     save_subscribers()
     await update.effective_message.reply_text(
-        f"Бот активний. Сканування кожні {INTERVAL} хв.\n"
-        "W1/D1 контекст → H4 напрямок → H1 зона та підтвердження.\n"
-        "Входи: SNR, RB-патерн, FVG; без Stochastic і M15.\n"
-        "Команди: /status /symbols /scan /help")
+        f"Dmytro Gold Signals активний. Сканування кожні {INTERVAL} хв.\n"
+        "Логіка: W1/D1 контекст → H4/H1 SNR, RB, FVG → підтвердження закритою H1-свічкою.\n"
+        "M15 і Stochastic повністю прибрані. Автоматичні угоди не відкриваються.\n"
+        "Команди: /status /symbols /scan /help"
+    )
 
 
-async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        f"Запущений. Інтервал {INTERVAL} хв. Підписників: {len(SUBSCRIBERS)}.\n"
-        "W1/D1 → H4 → H1 підтвердження. Stochastic вимкнений; автоматичні угоди вимкнені.")
+        f"Бот працює. Інтервал: {INTERVAL} хв. Підписників: {len(SUBSCRIBERS)}.\n"
+        "H1-підтвердження; M15 і Stochastic вимкнені; автоматичної торгівлі немає."
+    )
 
 
-async def symbols(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Інструменти:\n"+"\n".join("• "+s for s in SYMBOLS))
+async def symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("Інструменти:\n" + "\n".join("• " + s for s in SYMBOLS))
 
 
-async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("/start — підписатися\n/status — стан\n/symbols — список\n/scan — сканування з діагностикою\n/help — допомога")
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "/start — підписатися\n/status — стан бота\n/symbols — список інструментів\n"
+        "/scan — сканувати зараз із діагностикою\n/help — команди"
+    )
 
 
-async def scan_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Сканую 9 інструментів; це може зайняти кілька хвилин.")
-    await scan(ctx.application, update.effective_chat.id)
+async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("Сканую 9 інструментів за H1-підтвердженням; M15 і Stochastic не використовуються.")
+    await scan(context.application, update.effective_chat.id)
 
 
 async def post_init(app: Application):
     load_subscribers()
     if app.job_queue is None:
-        raise RuntimeError('Додай python-telegram-bot[job-queue] до requirements.txt')
-    app.job_queue.run_repeating(job, interval=INTERVAL*60, first=15, name="market-scan")
+        raise RuntimeError("У requirements.txt має бути python-telegram-bot[job-queue]")
+    app.job_queue.run_repeating(scheduled_scan, interval=INTERVAL * 60, first=15, name="market-scan")
     log.info("Bot started. Subscribers=%d", len(SUBSCRIBERS))
 
 
