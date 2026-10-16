@@ -185,14 +185,27 @@ def analyze(h1, m15, h4, d1, w1):
         elif kp > 80 and dp > 80 and kn <= 80 and kp >= dp and kn < dn:
             stoch_side, stoch_text = "SELL", f"M15 Stochastic вихід із перекупленості (%K={kn:.1f}, %D={dn:.1f})"
 
+    # M15 confirmation can come from any of three routes:
+    # 1) directional candle close; 2) local SNR/FVG/RB reaction; 3) Stochastic exit.
+    # Keep the candle closed before evaluating signals.
+    m15_setups = timeframe_setups(m15, "M15")
+    m15_zone_reasons = m15_setups[side]
     if side == "BUY":
-        m15_confirmed = mcl > mop and mcl > mpcl
+        m15_candle_confirm = mcl > mop and mcl > mpcl
     else:
-        m15_confirmed = mcl < mop and mcl < mpcl
-    if stoch_side == side:
-        reasons.append(stoch_text)
-    elif not m15_confirmed:
-        return None, f"{side}: H1/H4 зона є, але немає підтвердження M15"
+        m15_candle_confirm = mcl < mop and mcl < mpcl
+
+    m15_confirm_routes = []
+    if m15_candle_confirm:
+        m15_confirm_routes.append("M15: свічкове підтвердження")
+    if m15_zone_reasons:
+        m15_confirm_routes.extend(m15_zone_reasons)
+    if stoch_side == side and stoch_text:
+        m15_confirm_routes.append(stoch_text)
+
+    if not m15_confirm_routes:
+        return None, f"{side}: зона H1/H4 є, але M15 не підтвердив свічкою, SNR/FVG/RB або Stochastic"
+    reasons.extend(m15_confirm_routes)
 
     # Entry at last completed M15 close; stop based on recent H1 structure.
     entry = mcl
