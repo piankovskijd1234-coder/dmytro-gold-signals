@@ -19,10 +19,14 @@ SYMBOLS = {
     "GBP/USD": "GBPUSD=X",
     "EUR/JPY": "EURJPY=X",
     "AUD/USD": "AUDUSD=X",
-    "XAG/USD": "XAGUSD=X",  # Yahoo spot-like quote; may still differ from broker CFD
+    "XAG/USD": "XAGUSD=X",
     "EUR/AUD": "EURAUD=X",
     "USD/CHF": "CHF=X",
-    "XAU/USD": "XAUUSD=X",  # Yahoo spot-like quote; may still differ from broker CFD
+    "XAU/USD": "XAUUSD=X",
+}
+FALLBACK_TICKERS = {
+    "XAU/USD": ["GC=F"],
+    "XAG/USD": ["SI=F"],
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -196,6 +200,19 @@ def download(ticker, period, interval):
         return pd.DataFrame()
 
 
+def download_for_symbol(symbol, period, interval):
+    """Try the preferred Yahoo ticker, then a documented fallback if data is missing."""
+    primary = SYMBOLS[symbol]
+    candidates = [primary] + FALLBACK_TICKERS.get(symbol, [])
+    for ticker in candidates:
+        frame = download(ticker, period, interval)
+        if not frame.empty and len(frame) >= 20:
+            if ticker != primary:
+                log.warning("%s: using fallback Yahoo ticker %s; price may differ from broker spot/CFD", symbol, ticker)
+            return frame, ticker
+    return pd.DataFrame(), primary
+
+
 def ema_bias(frame):
     """Trend context from already-closed candles only."""
     if frame.empty or len(frame) < 50:
@@ -329,10 +346,15 @@ def analyze(h1, h4, d1, w1):
 
     w_bias, d_bias, h4_bias = ema_bias(w1c), ema_bias(d1c), ema_bias(h4c)
     expected = "BULL" if side == "BUY" else "BEAR"
-    # Strict daily direction filter: no signal against D1, and no signal if D1 is neutral.
-    if d_bias != expected:
-        return None, f"D1-фільтр: сигнал {side} відхилено, бо D1={d_bias}; потрібен D1={expected}"
+    # D1 is a context filter, not an absolute blocker when neutral.
+    # Never trade directly against D1. If D1 is neutral, require H4 to agree with H1.
+    if d_bias not in (expected, "NEUTRAL"):
+        return None, f"D1-фільтр: сигнал {side} відхилено, бо D1={d_bias}; напрямок протилежний"
+    if d_bias == "NEUTRAL" and h4_bias != expected:
+        return None, f"D1 нейтральний, а H4={h4_bias}; для сигналу {side} потрібне підтвердження H4={expected}"
     warnings = []
+    if d_bias == "NEUTRAL":
+        warnings.append("D1 нейтральний; напрямок підтверджено H4 і H1")
     for tf, bias in (("W1", w_bias), ("H4", h4_bias)):
         if bias not in ("NEUTRAL", expected):
             warnings.append(f"УВАГА: {tf} проти сигналу ({bias})")
@@ -394,11 +416,11 @@ async def scan(app, report_chat_id=None):
     diagnostics = []
     for symbol, ticker in SYMBOLS.items():
         try:
-            h1 = download(ticker, "60d", "1h")
-            d1 = download(ticker, "2y", "1d")
-            w1 = download(ticker, "5y", "1wk")
+            h1, used_ticker = download_for_symbol(symbol, "60d", "1h")
+            d1, _ = download_for_symbol(symbol, "2y", "1d")
+            w1, _ = download_for_symbol(symbol, "5y", "1wk")
             if h1.empty or d1.empty or w1.empty:
-                diagnostics.append(f"{symbol}: Yahoo Finance не повернув достатньо даних")
+                diagnostics.append(f"{symbol}: Yahoo Finance не повернув достатньо даних (основний тикер {ticker}; fallback перевірено)")
                 continue
             # Do not send another signal for a symbol while its previous signal is unresolved.
             active_before = ACTIVE_SIGNALS.get(symbol)
@@ -495,7 +517,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_subscribers()
     await update.effective_message.reply_text(
         f"Dmytro Gold Signals активний. Сканування кожні {INTERVAL} хв.\n"
-        "Логіка: обов’язковий напрямок D1 → H4/H1 SNR, RB або FVG → підтвердження закритою H1-свічкою.\n"
+        "Логіка: D1 не має суперечити сигналу; якщо D1 нейтральний, потрібен збіг H4 і H1. SNR/RB/FVG + закрита H1-свічка.\n"
         "M15 і Stochastic прибрані. Повторний сигнал по інструменту не надсилається, доки попередній не досягне SL або TP1. Автоматичних угод немає.\n"
         "Команди: /status /symbols /scan /help"
     )
@@ -503,8 +525,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        f"Бот працює. Інтервал: {INTERVAL} хв. Підписників: {len(SUBSCRIBERS)}.\n"
-        "Обов’язковий напрямок D1 + підтвердження закритою H1-свічкою; M15 і Stochastic вимкнені. Повторний сигнал блокується до TP2 або SL; повідомлення надсилаються на TP1, TP2 та SL. Автоматичної торгівлі немає. Дані: Yahoo Finance; золото/срібло — ф’ючерсні проксі."
+        f"Бот працює. Інтервал: {INTERVAL} хв. Підписників: {len(SUBSCRIBERS)}. Якщо після перезапуску число знову 0, потрібне постійне сховище Railway для subscribers.json.\n"
+        "D1 не має суперечити сигналу; якщо D1 нейтральний, потрібен збіг H4 і H1. H1-підтвердження; 2 тейки; повідомлення TP1/TP2/SL. M15 і Stochastic вимкнені; автоматичних угод немає. Yahoo Finance; XAU/XAG можуть перейти на ф’ючерсні проксі й відрізнятися від MT5."
     )
 
 
@@ -520,7 +542,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Сканую 9 інструментів. Напрямок D1 обов’язковий; підтвердження — закрита H1-свічка. H1 має підтвердити пробій, повернення в зону та закриття; 2 тейки, повідомлення TP1/TP2/SL; M15 і Stochastic вимкнені.")
+    await update.effective_message.reply_text("Сканую 9 інструментів. D1 не має суперечити сигналу; за нейтрального D1 потрібен збіг H4 і H1. Після сигналу відстежую повернення в зону; 2 тейки, повідомлення TP1/TP2/SL. M15 і Stochastic вимкнені.")
     await scan(context.application, update.effective_chat.id)
 
 
