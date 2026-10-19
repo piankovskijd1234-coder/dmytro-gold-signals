@@ -286,85 +286,95 @@ def rsi_series(close, period=14):
 
 
 def detect_smc_rsi(h1_closed):
-    """Find recent RSI reversal + liquidity sweep + CHoCH/BOS + FVG/OB confluence."""
+    """Practical SMC + RSI confluence using completed candles only."""
     if h1_closed.empty or len(h1_closed) < 60:
         return None, "Недостатньо H1-свічок для RSI та Smart Money"
 
     df = h1_closed.copy()
     df["rsi"] = rsi_series(df["close"])
-    # Look for a recent complete setup, but avoid using the forming candle.
-    start_i = max(25, len(df) - 8)
+    # Search the last 12 closed candles for a complete setup.
+    start_i = max(25, len(df) - 12)
     found = None
-    for i in range(start_i, len(df)):
-        row = df.iloc[i]
-        prev = df.iloc[i - 1]
-        prior20 = df.iloc[max(0, i - 20):i]
-        if len(prior20) < 15 or pd.isna(row.rsi) or pd.isna(prev.rsi):
-            continue
 
-        # RSI must leave an extreme zone: SELL crosses back below 70; BUY back above 30.
+    for i in range(start_i, len(df)):
+        row, prev = df.iloc[i], df.iloc[i - 1]
+        if pd.isna(row.rsi) or pd.isna(prev.rsi):
+            continue
         sell_rsi = float(prev.rsi) >= 70 and float(row.rsi) < 70
         buy_rsi = float(prev.rsi) <= 30 and float(row.rsi) > 30
-
-        prior_high = float(prior20.high.max())
-        prior_low = float(prior20.low.min())
-        sweep_sell = float(row.high) > prior_high and float(row.close) < prior_high
-        sweep_buy = float(row.low) < prior_low and float(row.close) > prior_low
-
-        # CHoCH/BOS confirmation must happen on the sweep candle or within the next 4 closed bars.
-        later = df.iloc[i:min(i + 5, len(df))]
-        if later.empty:
+        if not (buy_rsi or sell_rsi):
             continue
-        structure_buy = False
-        structure_sell = False
-        for j in range(i, min(i + 5, len(df))):
+        side = "BUY" if buy_rsi else "SELL"
+
+        # Liquidity sweep can occur up to five candles before RSI reversal.
+        sweep_idx = None
+        for k in range(i, max(4, i - 6), -1):
+            candle = df.iloc[k]
+            prior = df.iloc[max(0, k - 20):k]
+            if len(prior) < 10:
+                continue
+            if side == "BUY":
+                swept = float(candle.low) < float(prior.low.min()) and float(candle.close) > float(prior.low.min())
+            else:
+                swept = float(candle.high) > float(prior.high.max()) and float(candle.close) < float(prior.high.max())
+            if swept:
+                sweep_idx = k
+                break
+        if sweep_idx is None:
+            continue
+
+        # Structure shift must occur after the sweep, within five closed candles.
+        structure_idx = None
+        for j in range(sweep_idx + 1, min(i + 1, sweep_idx + 6)):
             candle = df.iloc[j]
             before = df.iloc[max(0, j - 5):j]
             if len(before) < 3:
                 continue
-            if float(candle.close) > float(before.high.max()):
-                structure_buy = True
-            if float(candle.close) < float(before.low.min()):
-                structure_sell = True
+            if side == "BUY" and float(candle.close) > float(before.high.max()):
+                structure_idx = j
+                break
+            if side == "SELL" and float(candle.close) < float(before.low.min()):
+                structure_idx = j
+                break
+        if structure_idx is None:
+            continue
 
-        # Smart Money zone confirmation: a nearby three-candle FVG or a reversal OB proxy.
-        scan = df.iloc[max(0, i - 12):min(i + 5, len(df))]
-        fvg_buy = fvg_sell = ob_buy = ob_sell = False
+        # Nearby FVG or opposing-candle order-block proxy.
+        zone_start = max(0, sweep_idx - 8)
+        zone_end = min(len(df), structure_idx + 2)
+        scan = df.iloc[zone_start:zone_end]
+        fvg = ob = False
         for k in range(2, len(scan)):
             left, middle, right = scan.iloc[k - 2], scan.iloc[k - 1], scan.iloc[k]
-            if float(left.high) < float(right.low):
-                gap_mid = (float(left.high) + float(right.low)) / 2
-                if abs(float(row.close) - gap_mid) <= max(abs(float(row.close)) * 0.004, float(row.high-row.low) * 4):
-                    fvg_buy = True
-            if float(left.low) > float(right.high):
-                gap_mid = (float(right.high) + float(left.low)) / 2
-                if abs(float(row.close) - gap_mid) <= max(abs(float(row.close)) * 0.004, float(row.high-row.low) * 4):
-                    fvg_sell = True
-            # Order-block proxy: opposing candle before a strong displacement candle.
-            if float(middle.close) < float(middle.open) and float(right.close) > float(right.open) and float(right.close) > float(middle.high):
-                ob_buy = True
-            if float(middle.close) > float(middle.open) and float(right.close) < float(right.open) and float(right.close) < float(middle.low):
-                ob_sell = True
+            if side == "BUY":
+                fvg |= float(left.high) < float(right.low)
+                ob |= (float(middle.close) < float(middle.open) and
+                       float(right.close) > float(right.open) and
+                       float(right.close) > float(middle.high))
+            else:
+                fvg |= float(left.low) > float(right.high)
+                ob |= (float(middle.close) > float(middle.open) and
+                       float(right.close) < float(right.open) and
+                       float(right.close) < float(middle.low))
+        if not (fvg or ob):
+            continue
 
-        if buy_rsi and sweep_buy and structure_buy and (fvg_buy or ob_buy):
-            found = {"side": "BUY", "index": i, "rsi": float(row.rsi),
-                     "reasons": ["RSI: повернення вище 30 після перепроданості",
-                                 "SMC: зняття ліквідності під локальними мінімумами",
-                                 "SMC: бичачий CHoCH/BOS",
-                                 "SMC: bullish FVG або Order Block"]}
-        elif sell_rsi and sweep_sell and structure_sell and (fvg_sell or ob_sell):
-            found = {"side": "SELL", "index": i, "rsi": float(row.rsi),
-                     "reasons": ["RSI: повернення нижче 70 після перекупленості",
-                                 "SMC: зняття ліквідності над локальними максимумами",
-                                 "SMC: ведмежий CHoCH/BOS",
-                                 "SMC: bearish FVG або Order Block"]}
-        if found:
-            break
+        if side == "BUY":
+            reasons = ["RSI: повернення вище 30 після перепроданості",
+                       "SMC: зняття ліквідності під локальними мінімумами",
+                       "SMC: бичачий CHoCH/BOS після зняття ліквідності",
+                       "SMC: знайдено bullish FVG або Order Block поблизу"]
+        else:
+            reasons = ["RSI: повернення нижче 70 після перекупленості",
+                       "SMC: зняття ліквідності над локальними максимумами",
+                       "SMC: ведмежий CHoCH/BOS після зняття ліквідності",
+                       "SMC: знайдено bearish FVG або Order Block поблизу"]
+        found = {"side": side, "index": i, "rsi": float(row.rsi), "reasons": reasons}
+        break
 
     if not found:
-        return None, "Немає повного збігу: RSI 70/30 + sweep ліквідності + CHoCH/BOS + FVG/OB"
+        return None, "Немає повного збігу в останніх 12 H1-свічках: RSI 70/30 + sweep + CHoCH/BOS + FVG/OB"
     return found, "Setup"
-
 
 def analyze(h1, h4, d1, w1):
     """SMC + RSI: W1/D1 context, H4 trend filter, H1 liquidity sweep and structure shift."""
