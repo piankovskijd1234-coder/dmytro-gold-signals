@@ -9,7 +9,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = "".join(os.getenv("TELEGRAM_BOT_TOKEN", "").split())
-INTERVAL = max(5, int(os.getenv("SCAN_INTERVAL_MINUTES", "5")))
+INTERVAL = max(5, int(os.getenv("SCAN_INTERVAL_MINUTES", "5")))  # New-entry scans; active trades are checked separately every minute.
 SUBSCRIBERS_FILE = "subscribers.json"
 ALERTS_FILE = "alerts.json"
 ACTIVE_FILE = "active_signals.json"
@@ -164,19 +164,19 @@ def check_active_signal(symbol, h1):
 async def notify_trade_events(app, symbol, item, events):
     for event, timestamp in events:
         if event == "TP1":
-            text = f"✅ TP1 досягнуто — {symbol} {item['side']}\nРівень: {fmt(symbol, float(item['tp1']))}\nСигнал активний, очікуємо TP2 або SL.\nH1: {timestamp}"
+            text = f"✅ TP1 досягнуто — {symbol} {item['side']}\nРівень: {fmt(symbol, float(item['tp1']))}\nСигнал активний, очікуємо TP2 або SL.\nСвічка: {timestamp}"
         elif event == "TP2":
-            text = f"🎯 TP2 досягнуто — {symbol} {item['side']}\nРівень: {fmt(symbol, float(item['tp2']))}\nСигнал завершено.\nH1: {timestamp}"
+            text = f"🎯 TP2 досягнуто — {symbol} {item['side']}\nРівень: {fmt(symbol, float(item['tp2']))}\nСигнал завершено.\nСвічка: {timestamp}"
         elif event == "AMBIGUOUS":
             text = (f"⚠️ НЕОДНОЗНАЧНА H1-СВІЧКА — {symbol} {item['side']}\n"
                     f"Діапазон свічки торкнувся і SL, і TP. За OHLC неможливо надійно визначити, що було першим.\n"
-                    f"Бот не зараховує SL/TP за цією свічкою; перевір котирування брокера.\nH1: {timestamp}")
+                    f"Бот не зараховує SL/TP за цією свічкою; перевір котирування брокера.\nСвічка: {timestamp}")
         elif event == "ENTRY_CONFIRMED":
-            text = f"✅ ПОЧАТКОВИЙ СИГНАЛ ПІДТВЕРДЖЕНО ПІСЛЯ ПОВЕРНЕННЯ В ЗОНУ — {symbol} {item['side']}\nЗона: {fmt(symbol, float(item.get('zone_low', item['entry'])))}–{fmt(symbol, float(item.get('zone_high', item['entry'])))}\nH1 закрилася в зоні в напрямку початкового сигналу {item['side']}.\nH1: {timestamp}"
+            text = f"✅ ПОЧАТКОВИЙ СИГНАЛ ПІДТВЕРДЖЕНО ПІСЛЯ ПОВЕРНЕННЯ В ЗОНУ — {symbol} {item['side']}\nЗона: {fmt(symbol, float(item.get('zone_low', item['entry'])))}–{fmt(symbol, float(item.get('zone_high', item['entry'])))}\nH1 закрилася в зоні в напрямку початкового сигналу {item['side']}.\nСвічка: {timestamp}"
         elif event == "CANCELLED":
-            text = f"❌ ПОЧАТКОВИЙ СИГНАЛ СКАСОВАНО — {symbol} {item['side']}\nПісля повернення до зони H1 закрилася суттєво проти початкового напрямку.\nH1: {timestamp}"
+            text = f"❌ ПОЧАТКОВИЙ СИГНАЛ СКАСОВАНО — {symbol} {item['side']}\nПісля повернення до зони H1 закрилася суттєво проти початкового напрямку.\nСвічка: {timestamp}"
         else:
-            text = f"🛑 STOP LOSS — {symbol} {item['side']}\nРівень: {fmt(symbol, float(item['sl']))}\nСигнал завершено.\nH1: {timestamp}"
+            text = f"🛑 STOP LOSS — {symbol} {item['side']}\nРівень: {fmt(symbol, float(item['sl']))}\nСигнал завершено.\nСвічка: {timestamp}"
         for chat_id in list(SUBSCRIBERS):
             try:
                 await app.bot.send_message(chat_id=chat_id, text=text)
@@ -557,17 +557,10 @@ async def scan(app, report_chat_id=None):
             if h1.empty or d1.empty or w1.empty:
                 diagnostics.append(f"{symbol}: Yahoo Finance не повернув достатньо даних (основний тикер {ticker}; fallback перевірено)")
                 continue
-            # Do not send another signal for a symbol while its previous signal is unresolved.
-            active_before = ACTIVE_SIGNALS.get(symbol)
-            active_note = check_active_signal(symbol, h1)
-            if isinstance(active_note, list) and active_before:
-                await notify_trade_events(app, symbol, active_before, active_note)
-                # Finish processing this symbol for this scan after any lifecycle event;
-                # don't instantly replace a just-completed/cancelled signal.
-                diagnostics.append(f"{symbol}: оброблено подію активного сигналу: {', '.join(e for e, _ in active_note)}")
-                continue
+            # Active signals are monitored by a separate one-minute job using 1m quotes.
+            # Never generate a second signal for the same symbol while one is unresolved.
             if symbol in ACTIVE_SIGNALS:
-                diagnostics.append(f"{symbol}: {active_note if isinstance(active_note, str) else 'активний сигнал; чекаємо TP2 або SL'}")
+                diagnostics.append(f"{symbol}: активний сигнал; TP/SL перевіряються окремо щохвилини")
                 continue
 
             # Build H4 from H1 data; label buckets in UTC.
@@ -647,11 +640,35 @@ async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
     await scan(context.application)
 
 
+async def monitor_active_signals(context: ContextTypes.DEFAULT_TYPE):
+    """Check active trades independently every minute using Yahoo 1-minute candles.
+
+    Yahoo quotes are not guaranteed real-time and may be unavailable for some tickers.
+    The function deliberately does not infer event order if a single candle spans both
+    SL and TP. Signals remain active until an unambiguous event is observed.
+    """
+    app = context.application
+    for symbol in list(ACTIVE_SIGNALS.keys()):
+        item = ACTIVE_SIGNALS.get(symbol)
+        if not item:
+            continue
+        try:
+            frame, used_ticker = download_for_symbol(symbol, "1d", "1m")
+            if frame.empty or len(frame) < 2:
+                log.warning("No usable 1m quotes for active signal %s; TP/SL check skipped this minute", symbol)
+                continue
+            events = check_active_signal(symbol, frame)
+            if isinstance(events, list) and events:
+                await notify_trade_events(app, symbol, item, events)
+        except Exception:
+            log.exception("Active signal monitor failed for %s", symbol)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SUBSCRIBERS.add(update.effective_chat.id)
     save_subscribers()
     await update.effective_message.reply_text(
-        f"Dmytro Gold Signals активний. Сканування кожні {INTERVAL} хв.\n"
+        f"Dmytro Gold Signals активний. Нові сигнали скануються кожні {INTERVAL} хв; активні TP/SL перевіряються окремо щохвилини.\n"
         "Логіка: RSI 70/30 + sweep ліквідності + CHoCH/BOS + FVG/OB; фільтр D1/H4.\n"
         "M15 і Stochastic прибрані. Повторний сигнал по інструменту не надсилається, доки попередній не завершиться на TP2 або SL. Автоматичних угод немає.\n"
         "Команди: /status /symbols /scan /help"
@@ -661,7 +678,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Бот працює. Інтервал: {INTERVAL} хв. Підписників: {len(SUBSCRIBERS)}. Якщо після перезапуску число знову 0, потрібне постійне сховище Railway для subscribers.json.\n"
-        "Три незалежні пошуки: Smart Money + RSI; Overbought/Oversold; Daily Support/Resistance (відбій або пробій+ретест). D1 зони, H4 підтвердження, H1 вхід; 2 тейки; повідомлення TP1/TP2/SL. Автоматичної торгівлі немає. Yahoo Finance може відрізнятися від Vantage MT5."
+        "Три незалежні пошуки: Smart Money + RSI; Overbought/Oversold; Daily Support/Resistance. Активні TP/SL перевіряються щохвилини за 1m Yahoo-котируваннями, якщо вони доступні. Автоматичної торгівлі немає. Yahoo Finance може відрізнятися від Vantage MT5 і не гарантує реального часу."
     )
 
 
@@ -688,7 +705,8 @@ async def post_init(app: Application):
     if app.job_queue is None:
         raise RuntimeError("У requirements.txt має бути python-telegram-bot[job-queue]")
     app.job_queue.run_repeating(scheduled_scan, interval=INTERVAL * 60, first=15, name="market-scan")
-    log.info("Bot started. Subscribers=%d", len(SUBSCRIBERS))
+    app.job_queue.run_repeating(monitor_active_signals, interval=60, first=20, name="active-signal-monitor-1m")
+    log.info("Bot started. Subscribers=%d; new-entry scan=%d min; active TP/SL monitor=60 sec", len(SUBSCRIBERS), INTERVAL)
 
 
 def main():
