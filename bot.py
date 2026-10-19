@@ -376,6 +376,69 @@ def detect_smc_rsi(h1_closed):
         return None, "Немає повного збігу в останніх 12 H1-свічках: RSI 70/30 + sweep + CHoCH/BOS + FVG/OB"
     return found, "Setup"
 
+def detect_overbought_oversold(h1_closed):
+    """Standalone RSI reversal strategy; uses completed H1 candles only."""
+    if h1_closed.empty or len(h1_closed) < 30:
+        return None, "Недостатньо H1-свічок для RSI"
+    df = h1_closed.copy()
+    df["rsi"] = rsi_series(df["close"])
+    # Inspect the latest 24 closed candles, newest first.
+    start = max(1, len(df) - 24)
+    for i in range(len(df) - 1, start - 1, -1):
+        cur, prev = df.iloc[i], df.iloc[i - 1]
+        if pd.isna(cur.rsi) or pd.isna(prev.rsi):
+            continue
+        # BUY: RSI was oversold and crosses back above 30, with bullish close.
+        if float(prev.rsi) <= 30 and float(cur.rsi) > 30 and float(cur.close) > float(cur.open):
+            return {"side": "BUY", "index": i, "rsi": float(cur.rsi),
+                    "reasons": ["Стратегія Overbought/Oversold", "RSI вийшов вище 30 із перепроданості", "Остання закрита H1-свічка бичача"]}, "Setup"
+        # SELL: RSI was overbought and crosses back below 70, with bearish close.
+        if float(prev.rsi) >= 70 and float(cur.rsi) < 70 and float(cur.close) < float(cur.open):
+            return {"side": "SELL", "index": i, "rsi": float(cur.rsi),
+                    "reasons": ["Стратегія Overbought/Oversold", "RSI опустився нижче 70 із перекупленості", "Остання закрита H1-свічка ведмежа"]}, "Setup"
+    return None, "Немає RSI-перетину 30/70 з підтверджувальною свічкою за останні 24 H1-свічки"
+
+
+
+def detect_daily_zone_setup(d1_closed, h4_closed, h1_closed):
+    """Daily support/resistance reaction or break-and-retest confirmed on H4/H1."""
+    if len(d1_closed) < 35 or len(h4_closed) < 10 or len(h1_closed) < 10:
+        return None, "Недостатньо даних для Daily зон"
+    # Use prior daily candles only; exclude the latest 3 days from level calculation
+    # to reduce the chance that the current reaction defines its own level.
+    prior = d1_closed.iloc[-63:-3] if len(d1_closed) >= 63 else d1_closed.iloc[:-3]
+    if len(prior) < 20:
+        return None, "Недостатньо історії Daily для зон"
+    support = float(prior.low.quantile(0.08))
+    resistance = float(prior.high.quantile(0.92))
+    last_h1 = h1_closed.iloc[-1]
+    prev_h1 = h1_closed.iloc[-2]
+    last_h4 = h4_closed.iloc[-1]
+    price = float(last_h1.close)
+    # Approximate tolerance with daily range, capped to avoid excessively broad zones.
+    daily_range = float((prior.high - prior.low).tail(20).median())
+    tolerance = max(daily_range * 0.18, abs(price) * 0.0015)
+    low, high = float(last_h1.low), float(last_h1.high)
+    op, close = float(last_h1.open), float(last_h1.close)
+    h4close = float(last_h4.close)
+    # Support bounce BUY: H1 tags the daily support area and closes bullish.
+    if low <= support + tolerance and close > op and close > support:
+        return {"side":"BUY", "index":len(h1_closed)-1, "rsi":float(rsi_series(h1_closed.close).iloc[-1]),
+                "reasons":[f"Daily підтримка: {support:.5f}", "H1 торкнулася зони підтримки та закрилася бичачою свічкою", "Стратегія Daily Support/Resistance"]}, "Daily support bounce"
+    # Support break + retest -> SELL. Require H4 close below support and H1 retest from below.
+    if h4close < support - tolerance and high >= support - tolerance and close < support and close < op:
+        return {"side":"SELL", "index":len(h1_closed)-1, "rsi":float(rsi_series(h1_closed.close).iloc[-1]),
+                "reasons":[f"Daily підтримку пробито: {support:.5f}", "H4 закрився нижче підтримки", "H1 зробила ретест знизу й закрилася ведмежою", "Стратегія Daily Break-and-Retest"]}, "Daily support breakdown retest"
+    # Resistance rejection SELL.
+    if high >= resistance - tolerance and close < op and close < resistance:
+        return {"side":"SELL", "index":len(h1_closed)-1, "rsi":float(rsi_series(h1_closed.close).iloc[-1]),
+                "reasons":[f"Daily опір: {resistance:.5f}", "H1 торкнулася зони опору та закрилася ведмежою свічкою", "Стратегія Daily Support/Resistance"]}, "Daily resistance rejection"
+    # Resistance break + retest -> BUY.
+    if h4close > resistance + tolerance and low <= resistance + tolerance and close > resistance and close > op:
+        return {"side":"BUY", "index":len(h1_closed)-1, "rsi":float(rsi_series(h1_closed.close).iloc[-1]),
+                "reasons":[f"Daily опір пробито: {resistance:.5f}", "H4 закрився вище опору", "H1 зробила ретест зверху й закрилася бичачою", "Стратегія Daily Break-and-Retest"]}, "Daily resistance breakout retest"
+    return None, f"Daily рівні: підтримка {support:.5f}, опір {resistance:.5f}; реакції/ретесту поки немає"
+
 def analyze(h1, h4, d1, w1):
     """SMC + RSI: W1/D1 context, H4 trend filter, H1 liquidity sweep and structure shift."""
     if len(h1) < 80 or len(h4) < 50 or len(d1) < 30 or len(w1) < 20:
@@ -386,9 +449,22 @@ def analyze(h1, h4, d1, w1):
     if min(len(h1c), len(h4c), len(d1c), len(w1c)) < 20:
         return None, "Недостатньо закритих свічок для аналізу"
 
-    setup, status = detect_smc_rsi(h1c)
-    if not setup:
-        return None, status
+    smc_setup, smc_status = detect_smc_rsi(h1c)
+    obos_setup, obos_status = detect_overbought_oversold(h1c)
+    daily_setup, daily_status = detect_daily_zone_setup(d1c, h4c, h1c)
+    # Three independent candidate sources: SMC+RSI, RSI reversal, or Daily zone reaction/retest.
+    # Choose the most recent completed-H1 setup, and never combine opposing candidates.
+    candidates = []
+    if smc_setup:
+        candidates.append((int(smc_setup["index"]), 3, smc_setup, "Smart Money + RSI"))
+    if obos_setup:
+        candidates.append((int(obos_setup["index"]), 2, obos_setup, "Overbought/Oversold"))
+    if daily_setup:
+        candidates.append((int(daily_setup["index"]), 1, daily_setup, "Daily Support/Resistance"))
+    if not candidates:
+        return None, f"Немає сигналу. SMC: {smc_status}. RSI: {obos_status}. Daily: {daily_status}"
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    _, _, setup, strategy_name = candidates[0]
     side = setup["side"]
 
     w_bias, d_bias, h4_bias = ema_bias(w1c), ema_bias(d1c), ema_bias(h4c)
@@ -425,7 +501,7 @@ def analyze(h1, h4, d1, w1):
             return None, "Не вдалося розрахувати стоп-лос"
         targets = [entry - risk, entry - 2 * risk]
 
-    reasons = setup["reasons"] + [f"RSI H1: {setup['rsi']:.1f}", "Контекст: W1/D1/H4 фільтр"] + warnings
+    reasons = [f"Стратегія: {strategy_name}"] + setup["reasons"] + [f"RSI H1: {setup['rsi']:.1f}", "Контекст: W1/D1/H4 фільтр"] + warnings
     return {
         "side": side, "entry": entry, "sl": sl, "tp": targets,
         "zone_low": entry - risk * 0.15, "zone_high": entry + risk * 0.15,
@@ -576,7 +652,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Бот працює. Інтервал: {INTERVAL} хв. Підписників: {len(SUBSCRIBERS)}. Якщо після перезапуску число знову 0, потрібне постійне сховище Railway для subscribers.json.\n"
-        "Стратегія SMC + RSI: RSI повертається з 70/30, sweep ліквідності, CHoCH/BOS та FVG/OB; D1/H4 фільтр; 2 тейки; повідомлення TP1/TP2/SL. Автоматичної торгівлі немає. Дані Yahoo Finance можуть відрізнятися від Vantage MT5."
+        "Три незалежні пошуки: Smart Money + RSI; Overbought/Oversold; Daily Support/Resistance (відбій або пробій+ретест). D1 зони, H4 підтвердження, H1 вхід; 2 тейки; повідомлення TP1/TP2/SL. Автоматичної торгівлі немає. Yahoo Finance може відрізнятися від Vantage MT5."
     )
 
 
@@ -592,7 +668,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Сканую 9 інструментів: RSI 70/30 + Smart Money (ліквідність, CHoCH/BOS, FVG/OB), фільтр D1/H4. Відстежую повернення в зону; 2 тейки, повідомлення TP1/TP2/SL.")
+    await update.effective_message.reply_text("Сканую 9 інструментів за трьома логіками: Smart Money + RSI, Overbought/Oversold, Daily підтримка/опір з відбоєм або пробоєм і ретестом. 2 тейки, сповіщення TP1/TP2/SL.")
     await scan(context.application, update.effective_chat.id)
 
 
