@@ -92,8 +92,8 @@ def save_active_signals():
 
 
 def check_active_signal(symbol, h1):
-    """Track original signal: return to entry zone, confirm original direction, TP1/TP2/SL or cancel."""
-
+    """Check only newly closed H1 candles. If TP and SL are both inside one candle,
+    report ambiguity rather than falsely claiming a stop or target was first."""
     item = ACTIVE_SIGNALS.get(symbol)
     if not item or h1.empty:
         return None
@@ -102,10 +102,11 @@ def check_active_signal(symbol, h1):
         ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
     except Exception:
         ts = h1.index[-2] if len(h1) > 1 else h1.index[-1]
+    # Exclude the currently forming candle; decisions use closed H1 bars only.
     closed = h1.iloc[:-1]
     bars = closed[closed.index > ts]
     if bars.empty:
-        return "активний сигнал; очікуємо повернення в зону входу або TP/SL"
+        return "активний сигнал; нової закритої H1-свічки ще немає"
 
     events = []
     side = item["side"]
@@ -122,9 +123,14 @@ def check_active_signal(symbol, h1):
         hit_tp1 = high >= tp1 if side == "BUY" else low <= tp1
         hit_tp2 = high >= tp2 if side == "BUY" else low <= tp2
 
+        # OHLC candles don't reveal the intrabar order. Never invent which level came first.
+        if hit_sl and (hit_tp1 or hit_tp2):
+            events.append(("AMBIGUOUS", timestamp))
+            item["last_checked"] = str(timestamp)
+            item["ambiguous_candle"] = str(timestamp)
+            continue
         if hit_sl:
-            if not item.get("sl_notified"):
-                events.append(("SL", timestamp))
+            events.append(("SL", timestamp))
             ACTIVE_SIGNALS.pop(symbol, None)
             break
         if hit_tp1 and not item.get("tp1_notified"):
@@ -134,8 +140,7 @@ def check_active_signal(symbol, h1):
             if not item.get("tp1_notified"):
                 events.append(("TP1", timestamp))
                 item["tp1_notified"] = True
-            if not item.get("tp2_notified"):
-                events.append(("TP2", timestamp))
+            events.append(("TP2", timestamp))
             ACTIVE_SIGNALS.pop(symbol, None)
             break
 
@@ -162,6 +167,10 @@ async def notify_trade_events(app, symbol, item, events):
             text = f"✅ TP1 досягнуто — {symbol} {item['side']}\nРівень: {fmt(symbol, float(item['tp1']))}\nСигнал активний, очікуємо TP2 або SL.\nH1: {timestamp}"
         elif event == "TP2":
             text = f"🎯 TP2 досягнуто — {symbol} {item['side']}\nРівень: {fmt(symbol, float(item['tp2']))}\nСигнал завершено.\nH1: {timestamp}"
+        elif event == "AMBIGUOUS":
+            text = (f"⚠️ НЕОДНОЗНАЧНА H1-СВІЧКА — {symbol} {item['side']}\n"
+                    f"Діапазон свічки торкнувся і SL, і TP. За OHLC неможливо надійно визначити, що було першим.\n"
+                    f"Бот не зараховує SL/TP за цією свічкою; перевір котирування брокера.\nH1: {timestamp}")
         elif event == "ENTRY_CONFIRMED":
             text = f"✅ ПОЧАТКОВИЙ СИГНАЛ ПІДТВЕРДЖЕНО ПІСЛЯ ПОВЕРНЕННЯ В ЗОНУ — {symbol} {item['side']}\nЗона: {fmt(symbol, float(item.get('zone_low', item['entry'])))}–{fmt(symbol, float(item.get('zone_high', item['entry'])))}\nH1 закрилася в зоні в напрямку початкового сигналу {item['side']}.\nH1: {timestamp}"
         elif event == "CANCELLED":
@@ -644,7 +653,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Dmytro Gold Signals активний. Сканування кожні {INTERVAL} хв.\n"
         "Логіка: RSI 70/30 + sweep ліквідності + CHoCH/BOS + FVG/OB; фільтр D1/H4.\n"
-        "M15 і Stochastic прибрані. Повторний сигнал по інструменту не надсилається, доки попередній не досягне SL або TP1. Автоматичних угод немає.\n"
+        "M15 і Stochastic прибрані. Повторний сигнал по інструменту не надсилається, доки попередній не завершиться на TP2 або SL. Автоматичних угод немає.\n"
         "Команди: /status /symbols /scan /help"
     )
 
