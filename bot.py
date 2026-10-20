@@ -11,7 +11,7 @@ logging.basicConfig(level=os.getenv('LOG_LEVEL','INFO'), format='%(asctime)s %(l
 log = logging.getLogger('signal-bot')
 TOKEN = ''.join(os.getenv('TELEGRAM_BOT_TOKEN','').split())
 SCAN_INTERVAL = max(60, int(os.getenv('SCAN_INTERVAL','300')))
-MIN_SCORE = max(1, min(8, int(os.getenv('MIN_CONFIRMATIONS','1'))))
+MIN_SCORE = max(1, min(2, int(os.getenv('MIN_CONFIRMATIONS','1'))))
 SUBSCRIBERS_FILE = Path('subscribers.json')
 ALERTS_FILE = Path('alerts.json')
 SYMBOLS = {
@@ -113,43 +113,109 @@ def fvg_status(df, lookback=120):
             return status, {'direction': 'SELL', 'low': lo, 'high': hi, 'filled': status.endswith('fully filled')}
     return 'no recent FVG', None
 
+def trendline_break_retest(df, atr_value):
+    """Signal only after a candle closes beyond a pivot trendline and a later candle retests it.
+
+    Uses confirmed pivots, a fitted line through recent swing points, and the last
+    closed candle as the retest-response candle. This is a transparent heuristic.
+    """
+    if len(df) < 40 or not np.isfinite(atr_value) or atr_value <= 0:
+        return 'NONE', 'not enough candles/ATR'
+    highs, lows = pivots(df, left=3, right=3)
+    n = len(df)
+    tolerance = max(atr_value * 0.25, abs(float(df['Close'].iloc[-1])) * 0.0002)
+    # Inspect recent confirmed swing points, excluding the latest 3 bars because pivots need right-side confirmation.
+    high_pts = [(i, float(highs.iloc[i])) for i in range(max(0, n-100), n-8) if np.isfinite(highs.iloc[i])]
+    low_pts = [(i, float(lows.iloc[i])) for i in range(max(0, n-100), n-8) if np.isfinite(lows.iloc[i])]
+    close = df['Close'].astype(float).to_numpy()
+    hi = df['High'].astype(float).to_numpy()
+    lo = df['Low'].astype(float).to_numpy()
+
+    def check(points, want):
+        # want='BUY': descending swing-high resistance; want='SELL': ascending swing-low support.
+        if len(points) < 2:
+            return False
+        pts = points[-4:]
+        xs = np.array([x for x, _ in pts], dtype=float)
+        ys = np.array([y for _, y in pts], dtype=float)
+        slope, intercept = np.polyfit(xs, ys, 1)
+        if want == 'BUY' and slope >= 0: return False
+        if want == 'SELL' and slope <= 0: return False
+        # Find a genuine close beyond the line, then a later retest; the latest candle must reject the line.
+        line = slope * np.arange(n) + intercept
+        for br in range(n-2, max(int(xs[-1])+1, n-13), -1):
+            if br < 1: continue
+            broke = close[br] > line[br] + tolerance*0.15 if want == 'BUY' else close[br] < line[br] - tolerance*0.15
+            if not broke: continue
+            for rt in range(br+1, n):
+                touched = lo[rt] <= line[rt] + tolerance if want == 'BUY' else hi[rt] >= line[rt] - tolerance
+                held = close[rt] > line[rt] if want == 'BUY' else close[rt] < line[rt]
+                if touched and held and rt == n-1:
+                    return True
+        return False
+
+    if check(high_pts, 'BUY'):
+        return 'BUY', 'close above descending trendline + retest held'
+    if check(low_pts, 'SELL'):
+        return 'SELL', 'close below ascending trendline + retest rejected'
+    return 'NONE', 'no confirmed close-and-retest setup'
+
+
 def analyze(frames):
-    # Keep the actual candle timestamp before resetting indices for calculations.
+    # Only two strategies are enabled: Smart Money and trendline break + retest.
     h1_raw = frames['H1']
     bar_time = pd.Timestamp(h1_raw.index[-1]).isoformat()
     h1, h4, d1, w1 = (frames[k].reset_index(drop=True) for k in ('H1', 'H4', 'D1', 'W1'))
-    close = h1['Close']; c = float(close.iloc[-1]); prev = float(close.iloc[-2])
-    e10, e20, e50 = ema(close, 10), ema(close, 20), ema(close, 50)
-    rv = float(rsi(close).iloc[-1]); av = float(atr(h1).iloc[-1])
+    close = h1['Close'].astype(float)
+    c = float(close.iloc[-1])
+    av = float(atr(h1).iloc[-1])
     if not np.isfinite(av) or av <= 0:
         av = float((h1['High'] - h1['Low']).tail(20).mean())
-    sig = {}
-    # These named setups are transparent rule-based approximations, not proprietary definitions.
-    sig['Американські гірки'] = 'BUY' if c > e50.iloc[-1] and prev < e20.iloc[-2] and c > e20.iloc[-1] else 'SELL' if c < e50.iloc[-1] and prev > e20.iloc[-2] and c < e20.iloc[-1] else 'NONE'
-    recent, prior = h1.iloc[-21:-1], h1.iloc[-41:-21]
-    comp = len(recent) == 20 and len(prior) == 20 and (recent['High'].max()-recent['Low'].min()) < (prior['High'].max()-prior['Low'].min())
-    sig['Вихід із трикутника'] = 'BUY' if comp and c > recent['High'].max() else 'SELL' if comp and c < recent['Low'].min() else 'NONE'
-    sig['Дракон у русі'] = 'BUY' if c > e10.iloc[-1] > e20.iloc[-1] > e50.iloc[-1] else 'SELL' if c < e10.iloc[-1] < e20.iloc[-1] < e50.iloc[-1] else 'NONE'
-    sig['Трамплін'] = 'BUY' if c > e50.iloc[-1] and h1['Low'].iloc[-1] <= e20.iloc[-1] and c > e20.iloc[-1] else 'SELL' if c < e50.iloc[-1] and h1['High'].iloc[-1] >= e20.iloc[-1] and c < e20.iloc[-1] else 'NONE'
-    # H1 approximation only; true scalping generally needs M1/M5 data.
-    sig['Скальпінг (H1-проксі)'] = 'BUY' if rv < 30 and c > prev else 'SELL' if rv > 70 and c < prev else 'NONE'
+    sig = {'Smart Money': 'NONE', 'Пробій трендової + ретест': 'NONE'}
+    details = {'Smart Money': 'no confirmed setup', 'Пробій трендової + ретест': ''}
+
+    # Smart Money proxy: confirmed swing break (BOS/CHOCH), liquidity sweep/reclaim,
+    # and an unfilled FVG in the same direction. An opposing open FVG is not itself a signal.
+    phs, pls = pivots(h1, left=3, right=3)
+    valid_hi = [(i, float(v)) for i, v in enumerate(phs) if np.isfinite(v) and i < len(h1)-3]
+    valid_lo = [(i, float(v)) for i, v in enumerate(pls) if np.isfinite(v) and i < len(h1)-3]
+    p_hi = valid_hi[-1][1] if valid_hi else np.nan
+    p_lo = valid_lo[-1][1] if valid_lo else np.nan
+    fvg, gap = fvg_status(h1)
+    prev = h1.iloc[-2]
+    recent = h1.iloc[-21:-1]
+    swept_low = len(recent) and float(prev['Low']) < float(recent['Low'].min()) and c > float(prev['Low'])
+    swept_high = len(recent) and float(prev['High']) > float(recent['High'].max()) and c < float(prev['High'])
+    bos_buy = np.isfinite(p_hi) and c > p_hi
+    bos_sell = np.isfinite(p_lo) and c < p_lo
+    gap_buy = bool(gap and gap['direction'] == 'BUY' and not gap['filled'])
+    gap_sell = bool(gap and gap['direction'] == 'SELL' and not gap['filled'])
+    # Require structure/liquidity evidence and same-direction FVG context to reduce arbitrary signals.
+    if bos_buy and (gap_buy or swept_low):
+        sig['Smart Money'] = 'BUY'
+        details['Smart Money'] = 'BOS bullish' + (' + bullish FVG open' if gap_buy else ' + sell-side liquidity sweep/reclaim')
+    elif bos_sell and (gap_sell or swept_high):
+        sig['Smart Money'] = 'SELL'
+        details['Smart Money'] = 'BOS bearish' + (' + bearish FVG open' if gap_sell else ' + buy-side liquidity sweep/reclaim')
+    elif swept_low and gap_buy:
+        sig['Smart Money'] = 'BUY'
+        details['Smart Money'] = 'sell-side liquidity sweep/reclaim + bullish FVG open (CHOCH proxy)'
+    elif swept_high and gap_sell:
+        sig['Smart Money'] = 'SELL'
+        details['Smart Money'] = 'buy-side liquidity sweep/reclaim + bearish FVG open (CHOCH proxy)'
+    else:
+        details['Smart Money'] = 'no matching BOS/CHOCH + liquidity/FVG setup'
+
+    tl_sig, tl_detail = trendline_break_retest(h1, av)
+    sig['Пробій трендової + ретест'] = tl_sig
+    details['Пробій трендової + ретест'] = tl_detail
+
     trend = []
     for df in (h4, d1, w1):
-        x = df['Close']; e50x, e200x = ema(x, 50).iloc[-1], ema(x, 200).iloc[-1]
+        x = df['Close'].astype(float)
+        e50x, e200x = ema(x, 50).iloc[-1], ema(x, 200).iloc[-1]
         trend.append('BUY' if x.iloc[-1] > e50x > e200x else 'SELL' if x.iloc[-1] < e50x < e200x else 'NONE')
-    sig['Позиційна торгівля'] = 'BUY' if trend.count('BUY') >= 2 else 'SELL' if trend.count('SELL') >= 2 else 'NONE'
-    sig['Overbought/Oversold'] = 'BUY' if rv < 25 and c > float(h1['High'].iloc[-2]) else 'SELL' if rv > 75 and c < float(h1['Low'].iloc[-2]) else 'NONE'
-    phs, pls = pivots(h1)
-    p_hi, p_lo = last_valid(phs), last_valid(pls)
-    fvg, gap = fvg_status(h1)
-    # BOS/CHOCH proxy: break the last confirmed pivot. Do not use an unfilled opposing FVG as an absolute veto.
-    smc = 'BUY' if np.isfinite(p_hi) and c > p_hi else 'SELL' if np.isfinite(p_lo) and c < p_lo else 'NONE'
-    if gap and not gap['filled'] and smc == 'BUY' and gap['direction'] == 'SELL':
-        smc = 'NONE'
-    if gap and not gap['filled'] and smc == 'SELL' and gap['direction'] == 'BUY':
-        smc = 'NONE'
-    sig['Smart Money'] = smc
-    return sig, c, av, fvg, trend, p_hi, p_lo, bar_time
+    return sig, c, av, fvg, trend, p_hi, p_lo, bar_time, details
 
 def price_precision(symbol):
     if symbol.startswith('BTC'): return 2
@@ -158,23 +224,25 @@ def price_precision(symbol):
     return 5
 
 def generate_messages(symbol, ticker, frames):
-    sig,entry,av,fvg,trend,ph,pl,bar=analyze(frames)
-    active={k:v for k,v in sig.items() if v in ('BUY','SELL')}
+    sig, entry, av, fvg, trend, ph, pl, bar, details = analyze(frames)
+    active = {k:v for k,v in sig.items() if v in ('BUY','SELL')}
     if not active: return []
-    bydir={'BUY':[k for k,v in active.items() if v=='BUY'], 'SELL':[k for k,v in active.items() if v=='SELL']}
+    bydir = {'BUY':[k for k,v in active.items() if v=='BUY'], 'SELL':[k for k,v in active.items() if v=='SELL']}
     out=[]; p=price_precision(symbol)
-    for direction,names in bydir.items():
-        if not names or len(names)<MIN_SCORE: continue
-        risk=max(1.5*av,abs(entry)*0.0005)
+    for direction, names in bydir.items():
+        if not names or len(names) < MIN_SCORE: continue
+        risk=max(1.5*av, abs(entry)*0.0005)
         sl,tp1,tp2=(entry-risk,entry+risk,entry+2*risk) if direction=='BUY' else (entry+risk,entry-risk,entry-2*risk)
         key=f'{symbol}|{direction}|{bar}|{",".join(sorted(names))}'
         if key in last_alerts: continue
-        opposite = 'SELL' if direction == 'BUY' else 'BUY'
-        conflict = (f"⚠️ Протилежний напрямок {opposite}: {', '.join(bydir[opposite])}. Не змішувати сигнали.\n" if bydir[opposite] else '')
+        opposite='SELL' if direction=='BUY' else 'BUY'
+        conflict=(f'⚠️ Протилежний напрямок {opposite}: {", ".join(bydir[opposite])}. Сигнали незалежні; не змішувати.\n' if bydir[opposite] else '')
+        why='\n'.join(f'• {name}: {details.get(name, "")}' for name in names)
         msg=(f'📊 SIGNAL — {symbol} ({ticker})\nНапрямок: {direction}\nСтратегії: {", ".join(names)}\n'
              f'Entry: {entry:.{p}f}\nSL: {sl:.{p}f}\nTP1: {tp1:.{p}f}\nTP2: {tp2:.{p}f}\n'
-             f'Підтвердження: {len(names)}/8\nFVG: {fvg}\nBOS/CHOCH: спрощений pivot-break; high={ph:.5g}, low={pl:.5g}\n'
-             f'Тренд H4/D1/W1: {trend}\n{conflict}Закрита H1-свічка: {bar}\n'
+             f'Підтвердження: {len(names)}/2 активні стратегії\nОбґрунтування:\n{why}\n'
+             f'FVG: {fvg}\nBOS/CHOCH: pivot-break proxy; high={ph:.5g}, low={pl:.5g}\n'
+             f'Тренд H4/D1/W1: {trend}\n{conflict}Закрита H1-свічка (UTC): {bar}\n'
              '⚠️ Сигнал інформаційний. Перевір спред, новини та ризик; прибуток не гарантований.')
         out.append((key,msg))
     return out
@@ -182,9 +250,9 @@ def generate_messages(symbol, ticker, frames):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subs=read_json(SUBSCRIBERS_FILE,[]); uid=update.effective_chat.id
     if uid not in subs: subs.append(uid); write_json(SUBSCRIBERS_FILE,subs)
-    await update.message.reply_text('Бот активний. Джерело цін: Yahoo Finance, не MT5. Команди: /status /symbols /scan')
+    await update.message.reply_text('Бот активний. Стратегії: Smart Money та пробій трендової з ретестом. Дані: Yahoo Finance, не MT5. Команди: /status /symbols /scan')
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f'Бот запущений. Інструментів: {len(SYMBOLS)}. Інтервал перевірки: {SCAN_INTERVAL} с. Поріг стратегій: {MIN_SCORE}.')
+    await update.message.reply_text(f'Бот запущений. Інструментів: {len(SYMBOLS)}. Стратегії: Smart Money + пробій трендової з ретестом. Інтервал: {SCAN_INTERVAL} с. Мінімум стратегій в одному напрямку: {MIN_SCORE}/2.')
 async def cmd_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('Інструменти: '+', '.join(SYMBOLS.keys()))
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -226,6 +294,6 @@ def main():
     app.add_handler(CommandHandler('start',cmd_start)); app.add_handler(CommandHandler('status',cmd_status))
     app.add_handler(CommandHandler('symbols',cmd_symbols)); app.add_handler(CommandHandler('scan',cmd_scan))
     app.job_queue.run_repeating(periodic, interval=SCAN_INTERVAL, first=15)
-    log.info('Starting signal bot; symbols=%s interval=%ss min confirmations=%s',list(SYMBOLS),SCAN_INTERVAL,MIN_SCORE)
+    log.info('Starting signal bot; enabled_strategies=Smart Money,Trendline Break+Retest symbols=%s interval=%ss min confirmations=%s',list(SYMBOLS),SCAN_INTERVAL,MIN_SCORE)
     app.run_polling(drop_pending_updates=True)
 if __name__=='__main__': main()
