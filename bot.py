@@ -20,7 +20,7 @@ SYMBOLS = {
     'EURAUD': 'EURAUD=X', 'USDCHF': 'USDCHF=X', 'GBPAUD': 'GBPAUD=X'
 }
 PERIODS = {'H1': ('60m', '730d'), 'H4': ('60m', '730d'), 'D1': ('1d', 'max'), 'W1': ('1wk', 'max')}
-last_alerts = {}
+last_alerts = set()
 
 
 def read_json(path, default):
@@ -79,49 +79,77 @@ def fetch_symbol(ticker):
         if len(df) < 205: raise RuntimeError(f'Insufficient {tf} candles: {len(df)}')
     return frames
 
-def fvg_status(df):
-    # Three-candle fair-value gap; distinguish price entering zone from fully traversing it.
-    close=float(df['Close'].iloc[-1])
-    for i in range(len(df)-1, 1, -1):
-        a,c=df.iloc[i-2],df.iloc[i]
-        if c['Low'] > a['High']:
-            lo,hi=float(a['High']),float(c['Low'])
-            if close <= lo: return 'bullish FVG fully filled'
-            if close < hi: return 'price inside bullish FVG'
-            return 'bullish FVG open'
-        if c['High'] < a['Low']:
-            lo,hi=float(c['High']),float(a['Low'])
-            if close >= hi: return 'bearish FVG fully filled'
-            if close > lo: return 'price inside bearish FVG'
-            return 'bearish FVG open'
-    return 'no recent FVG'
+def fvg_status(df, lookback=120):
+    """Return the most recent three-candle FVG and whether later candles filled it.
+
+    Bullish gap: High[i-2] < Low[i]. Its lower edge is High[i-2].
+    Bearish gap: Low[i-2] > High[i]. Its upper edge is Low[i-2].
+    A gap is fully filled only if a later candle trades through its far edge.
+    """
+    if len(df) < 3:
+        return 'no recent FVG', None
+    first = max(2, len(df) - lookback)
+    # Search newest to oldest, but validate fill using candles after the gap candle.
+    for i in range(len(df) - 1, first - 1, -1):
+        a, gap_candle = df.iloc[i-2], df.iloc[i]
+        later = df.iloc[i+1:]
+        if float(gap_candle['Low']) > float(a['High']):
+            lo, hi = float(a['High']), float(gap_candle['Low'])
+            if len(later) and (later['Low'] <= lo).any():
+                status = 'bullish FVG fully filled'
+            elif len(later) and (later['Low'] < hi).any():
+                status = 'bullish FVG partially filled'
+            else:
+                status = 'bullish FVG open'
+            return status, {'direction': 'BUY', 'low': lo, 'high': hi, 'filled': status.endswith('fully filled')}
+        if float(gap_candle['High']) < float(a['Low']):
+            lo, hi = float(gap_candle['High']), float(a['Low'])
+            if len(later) and (later['High'] >= hi).any():
+                status = 'bearish FVG fully filled'
+            elif len(later) and (later['High'] > lo).any():
+                status = 'bearish FVG partially filled'
+            else:
+                status = 'bearish FVG open'
+            return status, {'direction': 'SELL', 'low': lo, 'high': hi, 'filled': status.endswith('fully filled')}
+    return 'no recent FVG', None
 
 def analyze(frames):
-    h1,h4,d1,w1=(frames[k].reset_index(drop=True) for k in ('H1','H4','D1','W1'))
-    close=h1['Close']; c=float(close.iloc[-1]); prev=float(close.iloc[-2]); e10=ema(close,10); e20=ema(close,20); e50=ema(close,50)
-    rv=float(rsi(close).iloc[-1]); av=float(atr(h1).iloc[-1])
-    if not np.isfinite(av) or av<=0: av=float((h1['High']-h1['Low']).tail(20).mean())
-    sig={}
-    # Named discretionary systems differ by source; these are transparent rule-based proxies.
-    sig['Американские горки']='BUY' if c>e50.iloc[-1] and prev<e20.iloc[-2] and c>e20.iloc[-1] else 'SELL' if c<e50.iloc[-1] and prev>e20.iloc[-2] and c<e20.iloc[-1] else 'NONE'
-    recent=h1.iloc[-21:-1]; prior=h1.iloc[-41:-21]
-    comp=len(recent)==20 and len(prior)==20 and (recent['High'].max()-recent['Low'].min()) < (prior['High'].max()-prior['Low'].min())
-    sig['Вихід із трикутника']='BUY' if comp and c>recent['High'].max() else 'SELL' if comp and c<recent['Low'].min() else 'NONE'
-    sig['Дракон у русі']='BUY' if c>e10.iloc[-1]>e20.iloc[-1]>e50.iloc[-1] else 'SELL' if c<e10.iloc[-1]<e20.iloc[-1]<e50.iloc[-1] else 'NONE'
-    sig['Трамплін']='BUY' if c>e50.iloc[-1] and h1['Low'].iloc[-1]<=e20.iloc[-1] and c>e20.iloc[-1] else 'SELL' if c<e50.iloc[-1] and h1['High'].iloc[-1]>=e20.iloc[-1] and c<e20.iloc[-1] else 'NONE'
-    # H1 proxy only; true scalping needs M1/M5 data.
-    sig['Скальпінг (H1-проксі)']='BUY' if rv<30 and c>prev else 'SELL' if rv>70 and c<prev else 'NONE'
-    trend=[]
-    for df in (h4,d1,w1):
-        x=df['Close']; trend.append('BUY' if x.iloc[-1]>ema(x,50).iloc[-1]>ema(x,200).iloc[-1] else 'SELL' if x.iloc[-1]<ema(x,50).iloc[-1]<ema(x,200).iloc[-1] else 'NONE')
-    sig['Позиційна торгівля']='BUY' if trend.count('BUY')>=2 else 'SELL' if trend.count('SELL')>=2 else 'NONE'
-    sig['Overbought/Oversold']='BUY' if rv<25 and c>float(h1['High'].iloc[-2]) else 'SELL' if rv>75 and c<float(h1['Low'].iloc[-2]) else 'NONE'
-    ph,pl=pivots(h1); p_hi,p_lo=last_valid(ph),last_valid(pl); fvg=fvg_status(h1)
-    smc='BUY' if np.isfinite(p_hi) and c>p_hi else 'SELL' if np.isfinite(p_lo) and c<p_lo else 'NONE'
-    if smc=='BUY' and 'bearish FVG' in fvg: smc='NONE'
-    if smc=='SELL' and 'bullish FVG' in fvg: smc='NONE'
-    sig['Smart Money']=smc
-    return sig, c, av, fvg, trend, p_hi, p_lo, str(h1.index[-1])
+    # Keep the actual candle timestamp before resetting indices for calculations.
+    h1_raw = frames['H1']
+    bar_time = pd.Timestamp(h1_raw.index[-1]).isoformat()
+    h1, h4, d1, w1 = (frames[k].reset_index(drop=True) for k in ('H1', 'H4', 'D1', 'W1'))
+    close = h1['Close']; c = float(close.iloc[-1]); prev = float(close.iloc[-2])
+    e10, e20, e50 = ema(close, 10), ema(close, 20), ema(close, 50)
+    rv = float(rsi(close).iloc[-1]); av = float(atr(h1).iloc[-1])
+    if not np.isfinite(av) or av <= 0:
+        av = float((h1['High'] - h1['Low']).tail(20).mean())
+    sig = {}
+    # These named setups are transparent rule-based approximations, not proprietary definitions.
+    sig['Американські гірки'] = 'BUY' if c > e50.iloc[-1] and prev < e20.iloc[-2] and c > e20.iloc[-1] else 'SELL' if c < e50.iloc[-1] and prev > e20.iloc[-2] and c < e20.iloc[-1] else 'NONE'
+    recent, prior = h1.iloc[-21:-1], h1.iloc[-41:-21]
+    comp = len(recent) == 20 and len(prior) == 20 and (recent['High'].max()-recent['Low'].min()) < (prior['High'].max()-prior['Low'].min())
+    sig['Вихід із трикутника'] = 'BUY' if comp and c > recent['High'].max() else 'SELL' if comp and c < recent['Low'].min() else 'NONE'
+    sig['Дракон у русі'] = 'BUY' if c > e10.iloc[-1] > e20.iloc[-1] > e50.iloc[-1] else 'SELL' if c < e10.iloc[-1] < e20.iloc[-1] < e50.iloc[-1] else 'NONE'
+    sig['Трамплін'] = 'BUY' if c > e50.iloc[-1] and h1['Low'].iloc[-1] <= e20.iloc[-1] and c > e20.iloc[-1] else 'SELL' if c < e50.iloc[-1] and h1['High'].iloc[-1] >= e20.iloc[-1] and c < e20.iloc[-1] else 'NONE'
+    # H1 approximation only; true scalping generally needs M1/M5 data.
+    sig['Скальпінг (H1-проксі)'] = 'BUY' if rv < 30 and c > prev else 'SELL' if rv > 70 and c < prev else 'NONE'
+    trend = []
+    for df in (h4, d1, w1):
+        x = df['Close']; e50x, e200x = ema(x, 50).iloc[-1], ema(x, 200).iloc[-1]
+        trend.append('BUY' if x.iloc[-1] > e50x > e200x else 'SELL' if x.iloc[-1] < e50x < e200x else 'NONE')
+    sig['Позиційна торгівля'] = 'BUY' if trend.count('BUY') >= 2 else 'SELL' if trend.count('SELL') >= 2 else 'NONE'
+    sig['Overbought/Oversold'] = 'BUY' if rv < 25 and c > float(h1['High'].iloc[-2]) else 'SELL' if rv > 75 and c < float(h1['Low'].iloc[-2]) else 'NONE'
+    phs, pls = pivots(h1)
+    p_hi, p_lo = last_valid(phs), last_valid(pls)
+    fvg, gap = fvg_status(h1)
+    # BOS/CHOCH proxy: break the last confirmed pivot. Do not use an unfilled opposing FVG as an absolute veto.
+    smc = 'BUY' if np.isfinite(p_hi) and c > p_hi else 'SELL' if np.isfinite(p_lo) and c < p_lo else 'NONE'
+    if gap and not gap['filled'] and smc == 'BUY' and gap['direction'] == 'SELL':
+        smc = 'NONE'
+    if gap and not gap['filled'] and smc == 'SELL' and gap['direction'] == 'BUY':
+        smc = 'NONE'
+    sig['Smart Money'] = smc
+    return sig, c, av, fvg, trend, p_hi, p_lo, bar_time
 
 def price_precision(symbol):
     if symbol.startswith('BTC'): return 2
@@ -140,8 +168,9 @@ def generate_messages(symbol, ticker, frames):
         risk=max(1.5*av,abs(entry)*0.0005)
         sl,tp1,tp2=(entry-risk,entry+risk,entry+2*risk) if direction=='BUY' else (entry+risk,entry-risk,entry-2*risk)
         key=f'{symbol}|{direction}|{bar}|{",".join(sorted(names))}'
-        if last_alerts.get(symbol)==key: continue
-        conflict='⚠️ Інші стратегії дають протилежний напрямок.\n' if bydir['BUY'] and bydir['SELL'] else ''
+        if key in last_alerts: continue
+        opposite = 'SELL' if direction == 'BUY' else 'BUY'
+        conflict = (f"⚠️ Протилежний напрямок {opposite}: {', '.join(bydir[opposite])}. Не змішувати сигнали.\n" if bydir[opposite] else '')
         msg=(f'📊 SIGNAL — {symbol} ({ticker})\nНапрямок: {direction}\nСтратегії: {", ".join(names)}\n'
              f'Entry: {entry:.{p}f}\nSL: {sl:.{p}f}\nTP1: {tp1:.{p}f}\nTP2: {tp2:.{p}f}\n'
              f'Підтвердження: {len(names)}/8\nFVG: {fvg}\nBOS/CHOCH: спрощений pivot-break; high={ph:.5g}, low={pl:.5g}\n'
@@ -159,23 +188,34 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('Інструменти: '+', '.join(SYMBOLS.keys()))
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Запускаю перевірку. Результати надішлю, якщо є сигнал; помилки дивись у Railway Logs.')
-    await scan_once(context.application, force_chat=update.effective_chat.id)
+    await update.message.reply_text('Запускаю перевірку 9 інструментів. Це може тривати до хвилини.')
+    result = await scan_once(context.application, force_chat=update.effective_chat.id)
+    await update.message.reply_text(f"Перевірку завершено. Сигнальних повідомлень: {result['signals']}. Помилок даних: {result['errors']}. Якщо сигналів немає — поточні умови не спрацювали; подробиці дивись у Railway Logs.")
 
 async def scan_once(app, force_chat=None):
     subs=read_json(SUBSCRIBERS_FILE,[])
     if force_chat and force_chat not in subs: subs.append(force_chat); write_json(SUBSCRIBERS_FILE,subs)
+    stats = {'signals': 0, 'errors': 0}
     for symbol,ticker in SYMBOLS.items():
         try:
             frames=await asyncio.to_thread(fetch_symbol,ticker)
+            symbol_signal_count = 0
             for key,msg in generate_messages(symbol,ticker,frames):
                 # Send to all registered chats; store dedup key only after at least one send succeeds.
                 sent=False
                 for chat in subs:
                     try: await app.bot.send_message(chat_id=chat,text=msg); sent=True
                     except Exception: log.exception('Telegram send failed for chat %s',chat)
-                if sent: last_alerts[symbol]=key
-        except Exception as e: log.exception('Scan failed for %s (%s): %s',symbol,ticker,e)
+                if sent:
+                    last_alerts.add(key)
+                    stats['signals'] += 1
+                    symbol_signal_count += 1
+            if symbol_signal_count == 0:
+                log.info('No new signal sent for %s (no setup or duplicate alert)', symbol)
+        except Exception as e:
+            stats['errors'] += 1
+            log.exception('Scan failed for %s (%s): %s',symbol,ticker,e)
+    return stats
 
 async def periodic(context: ContextTypes.DEFAULT_TYPE):
     await scan_once(context.application)
