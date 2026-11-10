@@ -1,249 +1,130 @@
-import os, json, logging, urllib.request, urllib.parse
-from datetime import datetime, timezone
-import numpy as np
+import os, json, logging
+from datetime import timezone
 import pandas as pd
 import yfinance as yf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-TOKEN = ''.join(os.getenv('TELEGRAM_BOT_TOKEN', '').split())
-SCAN_INTERVAL = max(60, int(os.getenv('SCAN_INTERVAL_SECONDS', '300')))
-RR = max(0.5, float(os.getenv('RISK_REWARD', '2.0')))
-SUBS_FILE, SENT_FILE = 'subscribers.json', 'sent_signals.json'
-SYMBOLS = {'BTCUSD':'BTC-USD','EURUSD':'EURUSD=X','GBPUSD':'GBPUSD=X','EURJPY':'EURJPY=X','AUDUSD':'AUDUSD=X','XAGUSD':'XAGUSD=X','EURAUD':'EURAUD=X','USDCHF':'CHF=X','GBPAUD':'GBPAUD=X'}
-TIMEFRAMES = ('H1','H4','D1','W1')
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-log = logging.getLogger('gold-signals')
+TOKEN="".join(os.getenv("TELEGRAM_BOT_TOKEN","").split())
+INTERVAL=max(5,int(os.getenv("SCAN_INTERVAL_MINUTES","15")))
+SUBSCRIBERS_FILE="subscribers.json"
+SYMBOLS={"BTCUSD":"BTC-USD","EURUSD":"EURUSD=X","GBPUSD":"GBPUSD=X","EURJPY":"EURJPY=X","AUDUSD":"AUDUSD=X","XAGUSD":"XAGUSD=X","EURAUD":"EURAUD=X","USDCHF":"CHF=X","GBPAUD":"GBPAUD=X"}
+logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log=logging.getLogger("dmytro-gold-signals")
+subs=set()
+sent_keys=set()
 
-def load_json(path, default):
+def load_subs():
+    global subs
     try:
-        with open(path, encoding='utf-8') as f: return json.load(f)
-    except (OSError, json.JSONDecodeError): return default
+        with open(SUBSCRIBERS_FILE,encoding="utf-8") as f: subs={int(x) for x in json.load(f)}
+    except Exception: subs=set()
 
-def save_json(path, obj):
-    tmp = path+'.tmp'
-    with open(tmp,'w',encoding='utf-8') as f: json.dump(obj,f,ensure_ascii=False)
-    os.replace(tmp,path)
+def save_subs():
+    try:
+        with open(SUBSCRIBERS_FILE,"w",encoding="utf-8") as f: json.dump(sorted(subs),f)
+    except Exception: log.exception("save subscribers failed")
 
-def clean(df):
-    if df is None or df.empty: return pd.DataFrame()
-    if isinstance(df.columns,pd.MultiIndex): df.columns=df.columns.get_level_values(0)
-    cols=['Open','High','Low','Close','Volume']
-    if not all(c in df.columns for c in cols): return pd.DataFrame()
-    x=df[cols].copy()
-    for c in cols: x[c]=pd.to_numeric(x[c],errors='coerce')
-    return x.dropna(subset=['Open','High','Low','Close']).sort_index()
+def get_data(ticker,period,interval):
+    try:
+        d=yf.download(ticker,period=period,interval=interval,progress=False,auto_adjust=False,threads=False)
+        if d is None or d.empty: return pd.DataFrame()
+        if isinstance(d.columns,pd.MultiIndex): d.columns=d.columns.get_level_values(0)
+        d.columns=[str(c).title() for c in d.columns]
+        cols=["Open","High","Low","Close","Volume"]
+        return d[cols].dropna() if all(c in d.columns for c in cols) else pd.DataFrame()
+    except Exception:
+        log.exception("download failed %s %s",ticker,interval); return pd.DataFrame()
 
-def fetch(ticker):
-    h=clean(yf.download(ticker,period='60d',interval='1h',progress=False,threads=False,auto_adjust=False))
-    d=clean(yf.download(ticker,period='5y',interval='1d',progress=False,threads=False,auto_adjust=False))
-    if h.empty or d.empty: raise ValueError('Yahoo Finance повернув порожні дані')
-    agg={'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}
-    return {'H1':h,'H4':h.resample('4h').agg(agg).dropna(),'D1':d,'W1':d.resample('W').agg(agg).dropna()}
+def ema(s,n): return s.ewm(span=n,adjust=False).mean()
+def atr(d):
+    pc=d.Close.shift()
+    tr=pd.concat([d.High-d.Low,(d.High-pc).abs(),(d.Low-pc).abs()],axis=1).max(axis=1)
+    return tr.rolling(14).mean()
+def rsi(s):
+    delta=s.diff()
+    up=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean()
+    dn=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
+    rs=up/dn.replace(0,float("nan"))
+    return 100-100/(1+rs)
+def bias(d):
+    if len(d)<200: return "NONE"
+    e50,e200=ema(d.Close,50).iloc[-1],ema(d.Close,200).iloc[-1]
+    c=d.Close.iloc[-1]
+    return "BUY" if c>e50>e200 else ("SELL" if c<e50<e200 else "NONE")
 
-def atr(df,n=14):
-    pc=df.Close.shift(1)
-    tr=pd.concat([df.High-df.Low,(df.High-pc).abs(),(df.Low-pc).abs()],axis=1).max(axis=1)
-    v=tr.rolling(n).mean().iloc[-1]
-    return float(v) if pd.notna(v) and v>0 else float(df.Close.iloc[-1])*.005
-
-def rsi(s,n=14):
-    delta=s.diff(); gain=delta.clip(lower=0).ewm(alpha=1/n,adjust=False).mean(); loss=(-delta.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
-    return 100-100/(1+gain/loss.replace(0,np.nan))
-
-def stoch(df,n=14):
-    lo=df.Low.rolling(n).min(); hi=df.High.rolling(n).max(); k=100*(df.Close-lo)/(hi-lo).replace(0,np.nan)
-    return k,k.rolling(3).mean()
-
-def signal(sym,ticker,tf,strategy,side,df,reason,sl):
-    entry=float(df.Close.iloc[-1]); risk=abs(entry-float(sl))
-    if not np.isfinite(risk) or risk<=0: return None
-    tp=entry+RR*risk if side=='BUY' else entry-RR*risk
-    return dict(symbol=sym,ticker=ticker,tf=tf,strategy=strategy,side=side,entry=entry,sl=float(sl),tp=tp,reason=reason,candle=pd.Timestamp(df.index[-1]).isoformat())
-
-def grid(sym,t,tf,d):
-    if len(d)<45:return None
-    a=atr(d); w=d.iloc[-41:-1]; top=float(w.High.max()); bot=float(w.Low.min()); width=top-bot
-    if width<=2*a:return None
-    p=(float(d.Close.iloc[-1])-bot)/width
-    if p<=.15:return signal(sym,t,tf,'Grid Trading','BUY',d,'Ціна біля нижньої межі 40-свічкового діапазону',bot-.35*a)
-    if p>=.85:return signal(sym,t,tf,'Grid Trading','SELL',d,'Ціна біля верхньої межі 40-свічкового діапазону',top+.35*a)
-
-def obos(sym,t,tf,d):
-    if len(d)<30:return None
-    x=rsi(d.Close); p,c=x.iloc[-2],x.iloc[-1]; a=atr(d)
-    if pd.notna(p) and pd.notna(c) and p<30<=c:return signal(sym,t,tf,'Overbought/Oversold','BUY',d,f'RSI повернувся вище 30 ({c:.1f})',float(d.Low.iloc[-6:].min())-.2*a)
-    if pd.notna(p) and pd.notna(c) and p>70>=c:return signal(sym,t,tf,'Overbought/Oversold','SELL',d,f'RSI повернувся нижче 70 ({c:.1f})',float(d.High.iloc[-6:].max())+.2*a)
-
-def ppr(sym,t,tf,d):
-    if len(d)<35:return None
-    x=d.iloc[-3:]; c1,c2,c3=x.iloc[0],x.iloc[1],x.iloc[2]; k,st=stoch(d); a=atr(d)
-    sup=float(d.Low.iloc[-25:-3].min()); res=float(d.High.iloc[-25:-3].max())
-    bull=c2.Low<c1.Low and c3.Close>c2.High and c3.Close>c3.Open and c2.Low<=sup+.35*a
-    bear=c2.High>c1.High and c3.Close<c2.Low and c3.Close<c3.Open and c2.High>=res-.35*a
-    k0,d0,k1,d1=k.iloc[-2],st.iloc[-2],k.iloc[-1],st.iloc[-1]
-    if not all(pd.notna(v) for v in (k0,d0,k1,d1)):return None
-    if bull and k0<=d0 and k1>d1 and k1<35:return signal(sym,t,tf,'PPR + Stochastic','BUY',d,'Бичачий 3-свічковий PPR біля підтримки + перетин Stochastic внизу',float(x.Low.min())-.2*a)
-    if bear and k0>=d0 and k1<d1 and k1>65:return signal(sym,t,tf,'PPR + Stochastic','SELL',d,'Ведмежий 3-свічковий PPR біля опору + перетин Stochastic вгорі',float(x.High.max())+.2*a)
-
-def fibonacci(sym,t,tf,d):
-    if len(d)<210:return None
-    e50=d.Close.ewm(span=50,adjust=False).mean().iloc[-1]; e200=d.Close.ewm(span=200,adjust=False).mean().iloc[-1]; a=atr(d); w=d.iloc[-61:-1]
-    hi_i=w.High.idxmax(); lo_i=w.Low.idxmin(); hi=float(w.High.max()); lo=float(w.Low.min()); last=d.iloc[-1]
-    if hi<=lo:return None
-    span=hi-lo
-    if e50>e200 and lo_i<hi_i:
-        f1,f2=hi-.618*span,hi-.382*span
-        if last.Low<=f2 and last.Low>=f1-.25*a and last.Close>last.Open and last.Close>f1:
-            return signal(sym,t,tf,'Американські гірки (Fibonacci)','BUY',d,'Висхідний тренд; корекція в зону 38.2–61.8% і бичача реакція',min(float(last.Low),f1)-.25*a)
-    if e50<e200 and hi_i<lo_i:
-        f1,f2=lo+.382*span,lo+.618*span
-        if last.High>=f1 and last.High<=f2+.25*a and last.Close<last.Open and last.Close<f2:
-            return signal(sym,t,tf,'Американські гірки (Fibonacci)','SELL',d,'Низхідний тренд; корекція в зону 38.2–61.8% і ведмежа реакція',max(float(last.High),f2)+.25*a)
-
-def triangle(sym,t,tf,d):
-    if len(d)<35:return None
-    w=d.iloc[-21:-1]; x=np.arange(len(w)); us,ui=np.polyfit(x,w.High.to_numpy(float),1); ls,li=np.polyfit(x,w.Low.to_numpy(float),1)
-    if not (us<0 and ls>0):return None
-    up=ui+us*len(w); low=li+ls*len(w); last=d.iloc[-1]; a=atr(d)
-    if last.Close>up and last.Close>last.Open:return signal(sym,t,tf,'Вихід із трикутника','BUY',d,'Закриття свічки вище верхньої спадної межі трикутника',min(float(last.Low),up)-.3*a)
-    if last.Close<low and last.Close<last.Open:return signal(sym,t,tf,'Вихід із трикутника','SELL',d,'Закриття свічки нижче нижньої висхідної межі трикутника',max(float(last.High),low)+.3*a)
-
-def binance_delta_for_candle(df):
-    """True taker-buy minus taker-sell volume for BTCUSDT H1 candle."""
-    candle_time = pd.Timestamp(df.index[-1])
-    if candle_time.tzinfo is None:
-        candle_time = candle_time.tz_localize('UTC')
-    start_ms = int(candle_time.timestamp() * 1000)
-    end_ms = start_ms + 60 * 60 * 1000 - 1
-    query = urllib.parse.urlencode({'symbol': 'BTCUSDT', 'startTime': start_ms, 'endTime': end_ms, 'limit': 1000})
-    url = 'https://api.binance.com/api/v3/aggTrades?' + query
-    req = urllib.request.Request(url, headers={'User-Agent': 'DmytroGoldSignals/1.0'})
-    with urllib.request.urlopen(req, timeout=12) as response:
-        trades = json.loads(response.read().decode('utf-8'))
-    if not isinstance(trades, list) or not trades:
-        raise ValueError('Binance не повернула угоди для цієї H1-свічки')
-    buy = sell = 0.0
-    for trade in trades:
-        quote_volume = float(trade['p']) * float(trade['q'])
-        # m=True means buyer was maker, therefore seller was the aggressor.
-        if trade.get('m'):
-            sell += quote_volume
-        else:
-            buy += quote_volume
-    total = buy + sell
-    if total <= 0:
-        raise ValueError('Нульовий обсяг Binance')
-    return buy, sell, (buy - sell) / total, 'BINANCE_TAKER_DELTA'
-
-
-def order_flow(sym, ticker, tf, d):
-    """Order Flow: price direction + relative volume + delta + market context.
-
-    BTCUSD uses Binance BTCUSDT taker flow on H1 (close proxy, not identical
-    instrument). Other markets and higher timeframes use an explicitly labelled
-    candle-direction volume estimate, not true bid/ask delta.
-    """
-    if len(d) < 60:
-        return None
-    last = d.iloc[-1]
-    vol = float(last.Volume) if pd.notna(last.Volume) else 0.0
-    avg_vol = float(d.Volume.iloc[-21:-1].mean()) if d.Volume.iloc[-21:-1].notna().any() else 0.0
-    if vol <= 0 or avg_vol <= 0 or vol < 1.15 * avg_vol:
-        return None
-
-    if sym == 'BTCUSD' and tf == 'H1':
-        try:
-            buy, sell, delta_ratio, source = binance_delta_for_candle(d)
-        except Exception as exc:
-            log.warning('Order Flow BTC: Binance Delta недоступна: %s', exc)
-            return None  # Never silently replace true Delta with a proxy for BTC H1.
-        delta_text = f'Binance taker Delta {delta_ratio:+.1%}; buy={buy:.0f}, sell={sell:.0f} USDT'
+def analyze(symbol,ticker):
+    h1=get_data(ticker,"60d","1h"); h4=get_data(ticker,"730d","4h"); d1=get_data(ticker,"5y","1d")
+    if min(len(h1),len(h4),len(d1))<205: raise ValueError("Недостатньо історичних даних H1/H4/D1")
+    b4,b1=bias(h4),bias(d1)
+    if b4=="NONE" or b4!=b1: return None
+    h=h1.iloc[:-1].copy()
+    h["e20"]=ema(h.Close,20); h["e50"]=ema(h.Close,50); h["atr"]=atr(h); h["rsi"]=rsi(h.Close)
+    h=h.dropna()
+    if len(h)<30: return None
+    c=h.iloc[-1]; prev=h.iloc[-21:-1]; recent=h.iloc[-6:-1]
+    level=float(prev.High.max()) if b4=="BUY" else float(prev.Low.min())
+    av=float(c.atr); close=float(c.Close); rv=float(c.rsi)
+    if not av or pd.isna(av): return None
+    if b4=="BUY":
+        ok=float(recent.Close.max())>level and float(c.Low)<=level+.25*av and close>level and close>float(c.Open) and close>c.e20>c.e50 and 50<=rv<=72
+        if not ok: return None
+        entry=close; sl=min(float(recent.Low.min()),level-.35*av); risk=entry-sl
+        if risk<=0:return None
+        tp=entry+2*risk
+        why="H4/D1 BUY; пробій структури вгору; ретест рівня втримано; EMA та RSI підтверджують рух."
     else:
-        signed = np.sign(d.Close - d.Open) * d.Volume.fillna(0)
-        window = signed.iloc[-5:].sum()
-        total = d.Volume.iloc[-5:].fillna(0).sum()
-        if total <= 0:
-            return None
-        delta_ratio = float(window / total)
-        source = 'CANDLE_DELTA_ESTIMATE'
-        delta_text = f'розрахункова Delta за свічками {delta_ratio:+.1%} (не Bid/Ask)'
+        ok=float(recent.Close.min())<level and float(c.High)>=level-.25*av and close<level and close<float(c.Open) and close<c.e20<c.e50 and 28<=rv<=50
+        if not ok:return None
+        entry=close; sl=max(float(recent.High.max()),level+.35*av); risk=sl-entry
+        if risk<=0:return None
+        tp=entry-2*risk
+        why="H4/D1 SELL; пробій структури вниз; ретест рівня відхилено; EMA та RSI підтверджують рух."
+    ts=h.index[-1]
+    if getattr(ts,"tzinfo",None) is None: ts=ts.replace(tzinfo=timezone.utc)
+    ts=ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return dict(symbol=symbol,side=b4,entry=entry,sl=sl,tp=tp,rsi=rv,time=ts,why=why)
 
-    ema20 = float(d.Close.ewm(span=20, adjust=False).mean().iloc[-1])
-    ema50 = float(d.Close.ewm(span=50, adjust=False).mean().iloc[-1])
-    a = atr(d)
-    if delta_ratio >= 0.20 and last.Close > last.Open and last.Close > ema20 and ema20 > ema50:
-        sl = min(float(last.Low), float(d.Low.iloc[-6:].min())) - 0.2 * a
-        return signal(sym, ticker, tf, 'Order Flow (Price + Volume + Delta + Market)', 'BUY', d,
-                      f'Ціна зростає; обсяг {vol/avg_vol:.2f}× середнього; {delta_text}; ринковий контекст bullish (EMA20>EMA50)', sl)
-    if delta_ratio <= -0.20 and last.Close < last.Open and last.Close < ema20 and ema20 < ema50:
-        sl = max(float(last.High), float(d.High.iloc[-6:].max())) + 0.2 * a
-        return signal(sym, ticker, tf, 'Order Flow (Price + Volume + Delta + Market)', 'SELL', d,
-                      f'Ціна падає; обсяг {vol/avg_vol:.2f}× середнього; {delta_text}; ринковий контекст bearish (EMA20<EMA50)', sl)
-    return None
+def price(x): return f"{x:.2f}" if abs(x)>=1000 else (f"{x:.4f}" if abs(x)>=10 else f"{x:.5f}")
+def message(s):
+    return (f"📊 SIGNAL — {s['symbol']}\\nТаймфрейм: H1; фільтр H4 + D1\\nНапрямок: {s['side']}\\n"
+    f"Стратегія: Trend Pullback + BOS + Retest\\nEntry: {price(s['entry'])}\\nSL: {price(s['sl'])}\\nTP: {price(s['tp'])}\\n"
+    f"Ризик/прибуток: 1:2\\nRSI: {s['rsi']:.1f}\\nОбґрунтування: {s['why']}\\nЗакрита H1-свічка: {s['time']}\\n"
+    "⚠️ Дані Yahoo можуть бути затримані й відрізнятися від брокера. Перевір спред, новини та ризик.")
 
-
-STRATEGIES=(grid,obos,ppr,fibonacci,triangle,order_flow)
-
-def scan_symbol(sym,ticker):
-    frames=fetch(ticker); found=[]; errors=[]
-    for tf in ('H1','H4','D1','W1'):
-        d=frames[tf].iloc[:-1].copy()
-        if len(d)<30:errors.append(f'{tf}: мало свічок');continue
-        for fn in STRATEGIES:
-            try:
-                s=fn(sym,ticker,tf,d)
-                if s:found.append(s)
-            except Exception as e:
-                log.exception('%s %s %s',sym,tf,fn.__name__);errors.append(f'{tf}/{fn.__name__}: {type(e).__name__}')
-    return found,errors
-
-def format_signal(s):
-    ts=pd.Timestamp(s['candle']); ts=ts.tz_localize('UTC') if ts.tzinfo is None else ts; ts=ts.tz_convert('UTC')
-    return (f"📊 SIGNAL — {s['symbol']} ({s['ticker']})\nТаймфрейм: {s['tf']}\nНапрямок: {s['side']}\nСтратегія: {s['strategy']}\nEntry: {s['entry']:.6g}\nSL: {s['sl']:.6g}\nTP: {s['tp']:.6g}\nОбґрунтування: {s['reason']}\nЗакрита свічка: {ts:%Y-%m-%d %H:%M UTC}\n⚠️ Інформаційний сигнал. Перевір спред, новини та ризик; прибуток не гарантований.")
-
-async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    subs=load_json(SUBS_FILE,[]); cid=update.effective_chat.id
-    if cid not in subs:subs.append(cid);save_json(SUBS_FILE,subs)
-    await update.message.reply_text('Бот активний. Smart Money вимкнено. Стратегії: Grid Trading, Overbought/Oversold, PPR + Stochastic, Американські гірки (Fibonacci), Вихід із трикутника, Order Flow. Команди: /status /symbols /scan /help')
-
-async def status(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f'Бот запущений. Інструментів: {len(SYMBOLS)}. Стратегій: 6 (без Smart Money). Таймфрейми: H1, H4, D1, W1. Інтервал: {SCAN_INTERVAL} с. Одна ціль TP; стандартне співвідношення ризику до прибутку 1:{RR:g}.')
-
-async def symbols(update:Update,context:ContextTypes.DEFAULT_TYPE): await update.message.reply_text('Інструменти: '+', '.join(SYMBOLS))
-async def help_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE): await update.message.reply_text('/start — підписка\n/status — стан\n/symbols — інструменти\n/scan — сканувати зараз\n/help — допомога')
-
-async def do_scan(app,targets=None):
-    targets=targets if targets is not None else load_json(SUBS_FILE,[]); sent=load_json(SENT_FILE,{}); count=0; errs=0
-    for sym,ticker in SYMBOLS.items():
+async def start(u:Update,c:ContextTypes.DEFAULT_TYPE):
+    subs.add(u.effective_chat.id); save_subs()
+    await u.message.reply_text("Бот активний. Одна стратегія: Trend Pullback + BOS + Retest. Команди: /status /symbols /scan")
+async def status(u,c):
+    await u.message.reply_text(f"Бот запущений. Інструментів: 9. Стратегія: Trend Pullback + BOS + Retest. Таймфрейми: H1 (вхід), H4 і D1 (фільтр). Один TP, R:R 1:2. Інтервал: {INTERVAL} хв.")
+async def symbols(u,c): await u.message.reply_text("Інструменти: "+", ".join(SYMBOLS))
+async def run_scan(chat_id,ctx):
+    n=err=0
+    for sym,tick in SYMBOLS.items():
         try:
-            signals,errors=scan_symbol(sym,ticker);errs+=len(errors)
-            for s in signals:
-                key='|'.join([s['symbol'],s['tf'],s['strategy'],s['side'],s['candle']])
-                if key in sent:continue
-                for cid in targets:
-                    try:await app.bot.send_message(chat_id=int(cid),text=format_signal(s))
-                    except Exception:log.exception('Не вдалося надіслати chat_id=%s',cid)
-                sent[key]=datetime.now(timezone.utc).isoformat();count+=1
-        except Exception:errs+=1;log.exception('Помилка інструмента %s',sym)
-    if len(sent)>2000:sent=dict(list(sent.items())[-1500:])
-    save_json(SENT_FILE,sent);log.info('Сканування завершено: сигналів=%d, помилок=%d',count,errs)
-    return count,errs
-
-async def scan_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Сканую 9 інструментів на H1, H4, D1, W1. Це може тривати кілька хвилин.')
-    n,e=await do_scan(context.application,[update.effective_chat.id])
-    await update.message.reply_text(f'Перевірку завершено. Нових сигналів: {n}. Помилок даних: {e}. Деталі — Railway Logs.')
-
-async def scheduled(context:ContextTypes.DEFAULT_TYPE): await do_scan(context.application)
-async def post_init(app):
-    if app.job_queue:app.job_queue.run_repeating(scheduled,interval=SCAN_INTERVAL,first=20);log.info('Планувальник запущено: %s секунд',SCAN_INTERVAL)
-
+            s=analyze(sym,tick)
+            if s:
+                key=f"{sym}:{s['side']}:{s['time']}"
+                if key not in sent_keys:
+                    await ctx.bot.send_message(chat_id=chat_id,text=message(s)); sent_keys.add(key); n+=1
+        except Exception: err+=1; log.exception("scan error %s",sym)
+    return n,err
+async def scan(u,c):
+    await u.message.reply_text("Сканую 9 інструментів. Це може тривати кілька хвилин.")
+    n,e=await run_scan(u.effective_chat.id,c)
+    await u.message.reply_text(f"Перевірку завершено. Нових сигналів: {n}. Помилок даних: {e}. Деталі — Railway Logs.")
+async def scheduled(c):
+    for chat in list(subs):
+        try: await run_scan(chat,c)
+        except Exception: log.exception("scheduled scan failed")
+async def help_cmd(u,c): await u.message.reply_text("/start — підписка\\n/status — стан\\n/symbols — інструменти\\n/scan — ручне сканування")
 def main():
-    if not TOKEN:raise RuntimeError('Не задано TELEGRAM_BOT_TOKEN')
-    app=Application.builder().token(TOKEN).post_init(post_init).build()
-    for name,fn in [('start',start),('status',status),('symbols',symbols),('help',help_cmd),('scan',scan_cmd)]:app.add_handler(CommandHandler(name,fn))
-    log.info('Запуск: Smart Money вимкнено; 6 стратегій активні, включно з Order Flow')
+    if not TOKEN: raise RuntimeError("Не задано TELEGRAM_BOT_TOKEN у Railway Variables")
+    load_subs()
+    app=Application.builder().token(TOKEN).build()
+    for cmd,fn in [("start",start),("status",status),("symbols",symbols),("scan",scan),("help",help_cmd)]: app.add_handler(CommandHandler(cmd,fn))
+    if app.job_queue is None: raise RuntimeError("JobQueue недоступний: перевір python-telegram-bot[job-queue]")
+    app.job_queue.run_repeating(scheduled,interval=INTERVAL*60,first=30)
+    log.info("Starting: %d symbols, interval %d min",len(SYMBOLS),INTERVAL)
     app.run_polling(drop_pending_updates=True)
-
-if __name__=='__main__':main()
+if __name__=="__main__": main()
