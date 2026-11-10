@@ -1,4 +1,4 @@
-import os, json, logging
+import os, json, logging, urllib.request, urllib.parse
 from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
@@ -109,7 +109,81 @@ def triangle(sym,t,tf,d):
     if last.Close>up and last.Close>last.Open:return signal(sym,t,tf,'Вихід із трикутника','BUY',d,'Закриття свічки вище верхньої спадної межі трикутника',min(float(last.Low),up)-.3*a)
     if last.Close<low and last.Close<last.Open:return signal(sym,t,tf,'Вихід із трикутника','SELL',d,'Закриття свічки нижче нижньої висхідної межі трикутника',max(float(last.High),low)+.3*a)
 
-STRATEGIES=(grid,obos,ppr,fibonacci,triangle)
+def binance_delta_for_candle(df):
+    """True taker-buy minus taker-sell volume for BTCUSDT H1 candle."""
+    candle_time = pd.Timestamp(df.index[-1])
+    if candle_time.tzinfo is None:
+        candle_time = candle_time.tz_localize('UTC')
+    start_ms = int(candle_time.timestamp() * 1000)
+    end_ms = start_ms + 60 * 60 * 1000 - 1
+    query = urllib.parse.urlencode({'symbol': 'BTCUSDT', 'startTime': start_ms, 'endTime': end_ms, 'limit': 1000})
+    url = 'https://api.binance.com/api/v3/aggTrades?' + query
+    req = urllib.request.Request(url, headers={'User-Agent': 'DmytroGoldSignals/1.0'})
+    with urllib.request.urlopen(req, timeout=12) as response:
+        trades = json.loads(response.read().decode('utf-8'))
+    if not isinstance(trades, list) or not trades:
+        raise ValueError('Binance не повернула угоди для цієї H1-свічки')
+    buy = sell = 0.0
+    for trade in trades:
+        quote_volume = float(trade['p']) * float(trade['q'])
+        # m=True means buyer was maker, therefore seller was the aggressor.
+        if trade.get('m'):
+            sell += quote_volume
+        else:
+            buy += quote_volume
+    total = buy + sell
+    if total <= 0:
+        raise ValueError('Нульовий обсяг Binance')
+    return buy, sell, (buy - sell) / total, 'BINANCE_TAKER_DELTA'
+
+
+def order_flow(sym, ticker, tf, d):
+    """Order Flow: price direction + relative volume + delta + market context.
+
+    BTCUSD uses Binance BTCUSDT taker flow on H1 (close proxy, not identical
+    instrument). Other markets and higher timeframes use an explicitly labelled
+    candle-direction volume estimate, not true bid/ask delta.
+    """
+    if len(d) < 60:
+        return None
+    last = d.iloc[-1]
+    vol = float(last.Volume) if pd.notna(last.Volume) else 0.0
+    avg_vol = float(d.Volume.iloc[-21:-1].mean()) if d.Volume.iloc[-21:-1].notna().any() else 0.0
+    if vol <= 0 or avg_vol <= 0 or vol < 1.15 * avg_vol:
+        return None
+
+    if sym == 'BTCUSD' and tf == 'H1':
+        try:
+            buy, sell, delta_ratio, source = binance_delta_for_candle(d)
+        except Exception as exc:
+            log.warning('Order Flow BTC: Binance Delta недоступна: %s', exc)
+            return None  # Never silently replace true Delta with a proxy for BTC H1.
+        delta_text = f'Binance taker Delta {delta_ratio:+.1%}; buy={buy:.0f}, sell={sell:.0f} USDT'
+    else:
+        signed = np.sign(d.Close - d.Open) * d.Volume.fillna(0)
+        window = signed.iloc[-5:].sum()
+        total = d.Volume.iloc[-5:].fillna(0).sum()
+        if total <= 0:
+            return None
+        delta_ratio = float(window / total)
+        source = 'CANDLE_DELTA_ESTIMATE'
+        delta_text = f'розрахункова Delta за свічками {delta_ratio:+.1%} (не Bid/Ask)'
+
+    ema20 = float(d.Close.ewm(span=20, adjust=False).mean().iloc[-1])
+    ema50 = float(d.Close.ewm(span=50, adjust=False).mean().iloc[-1])
+    a = atr(d)
+    if delta_ratio >= 0.20 and last.Close > last.Open and last.Close > ema20 and ema20 > ema50:
+        sl = min(float(last.Low), float(d.Low.iloc[-6:].min())) - 0.2 * a
+        return signal(sym, ticker, tf, 'Order Flow (Price + Volume + Delta + Market)', 'BUY', d,
+                      f'Ціна зростає; обсяг {vol/avg_vol:.2f}× середнього; {delta_text}; ринковий контекст bullish (EMA20>EMA50)', sl)
+    if delta_ratio <= -0.20 and last.Close < last.Open and last.Close < ema20 and ema20 < ema50:
+        sl = max(float(last.High), float(d.High.iloc[-6:].max())) + 0.2 * a
+        return signal(sym, ticker, tf, 'Order Flow (Price + Volume + Delta + Market)', 'SELL', d,
+                      f'Ціна падає; обсяг {vol/avg_vol:.2f}× середнього; {delta_text}; ринковий контекст bearish (EMA20<EMA50)', sl)
+    return None
+
+
+STRATEGIES=(grid,obos,ppr,fibonacci,triangle,order_flow)
 
 def scan_symbol(sym,ticker):
     frames=fetch(ticker); found=[]; errors=[]
@@ -131,10 +205,10 @@ def format_signal(s):
 async def start(update:Update,context:ContextTypes.DEFAULT_TYPE):
     subs=load_json(SUBS_FILE,[]); cid=update.effective_chat.id
     if cid not in subs:subs.append(cid);save_json(SUBS_FILE,subs)
-    await update.message.reply_text('Бот активний. Smart Money вимкнено. Стратегії: Grid Trading, Overbought/Oversold, PPR + Stochastic, Американські гірки (Fibonacci), Вихід із трикутника. Команди: /status /symbols /scan /help')
+    await update.message.reply_text('Бот активний. Smart Money вимкнено. Стратегії: Grid Trading, Overbought/Oversold, PPR + Stochastic, Американські гірки (Fibonacci), Вихід із трикутника, Order Flow. Команди: /status /symbols /scan /help')
 
 async def status(update:Update,context:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f'Бот запущений. Інструментів: {len(SYMBOLS)}. Стратегій: 5 (без Smart Money). Таймфрейми: H1, H4, D1, W1. Інтервал: {SCAN_INTERVAL} с. Одна ціль TP; стандартне співвідношення ризику до прибутку 1:{RR:g}.')
+    await update.message.reply_text(f'Бот запущений. Інструментів: {len(SYMBOLS)}. Стратегій: 6 (без Smart Money). Таймфрейми: H1, H4, D1, W1. Інтервал: {SCAN_INTERVAL} с. Одна ціль TP; стандартне співвідношення ризику до прибутку 1:{RR:g}.')
 
 async def symbols(update:Update,context:ContextTypes.DEFAULT_TYPE): await update.message.reply_text('Інструменти: '+', '.join(SYMBOLS))
 async def help_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE): await update.message.reply_text('/start — підписка\n/status — стан\n/symbols — інструменти\n/scan — сканувати зараз\n/help — допомога')
@@ -169,7 +243,7 @@ def main():
     if not TOKEN:raise RuntimeError('Не задано TELEGRAM_BOT_TOKEN')
     app=Application.builder().token(TOKEN).post_init(post_init).build()
     for name,fn in [('start',start),('status',status),('symbols',symbols),('help',help_cmd),('scan',scan_cmd)]:app.add_handler(CommandHandler(name,fn))
-    log.info('Запуск: Smart Money вимкнено; активні стратегії: Grid, OB/OS, PPR+Stochastic, Fibonacci, Triangle')
+    log.info('Запуск: Smart Money вимкнено; 6 стратегій активні, включно з Order Flow')
     app.run_polling(drop_pending_updates=True)
 
 if __name__=='__main__':main()
