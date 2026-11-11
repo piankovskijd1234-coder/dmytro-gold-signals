@@ -12,7 +12,8 @@ SUB_FILE="subscribers.json"
 SYMBOLS={
  "BTCUSD":"BTC-USD","EURUSD":"EURUSD=X","GBPUSD":"GBPUSD=X",
  "EURJPY":"EURJPY=X","AUDUSD":"AUDUSD=X","XAGUSD":"XAGUSD=X",
- "EURAUD":"EURAUD=X","USDCHF":"CHF=X","GBPAUD":"GBPAUD=X"
+ "EURAUD":"EURAUD=X","USDCHF":"CHF=X","GBPAUD":"GBPAUD=X",
+ "GER40":"^GDAXI"
 }
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log=logging.getLogger("dmytro-gold-signals")
