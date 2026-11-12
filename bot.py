@@ -147,19 +147,51 @@ def find_h4_poi(frame, side):
     return None
 
 def h1_bos_retest(frame, side):
-    if frame.empty or len(frame) < 25:
+    if frame.empty or len(frame) < 30:
         return None
-    prior = frame.iloc[-22:-2]
-    previous, last = frame.iloc[-2], frame.iloc[-1]
+    # Use a prior swing level, then allow the retest to occur over several
+    # completed H1 candles instead of requiring it on exactly the latest candle.
+    prior = frame.iloc[-30:-9]
+    window = frame.iloc[-9:-1]  # completed candles only
     if side == "BUY":
         level = float(prior.high.max())
-        broke = float(previous.close) > level or float(last.close) > level
-        retested = float(last.low) <= level * 1.002 and float(last.close) >= level
-    else:
-        level = float(prior.low.min())
-        broke = float(previous.close) < level or float(last.close) < level
-        retested = float(last.high) >= level * 0.998 and float(last.close) <= level
-    return level if broke and retested else None
+        broke_at = None
+        for i, candle in enumerate(window.itertuples()):
+            if float(candle.close) > level:
+                broke_at = i
+                break
+        if broke_at is None:
+            return None
+        after = list(window.iloc[broke_at + 1:].itertuples())
+        if not after:
+            return None
+        for candle in after:
+            touched = float(candle.low) <= level * 1.002
+            held = float(candle.close) >= level
+            if touched and held:
+                latest = frame.iloc[-1]
+                if float(latest.close) > float(latest.open):
+                    return level
+        return None
+    level = float(prior.low.min())
+    broke_at = None
+    for i, candle in enumerate(window.itertuples()):
+        if float(candle.close) < level:
+            broke_at = i
+            break
+    if broke_at is None:
+        return None
+    after = list(window.iloc[broke_at + 1:].itertuples())
+    if not after:
+        return None
+    for candle in after:
+        touched = float(candle.high) >= level * 0.998
+        held = float(candle.close) <= level
+        if touched and held:
+            latest = frame.iloc[-1]
+            if float(latest.close) < float(latest.open):
+                return level
+    return None
 
 def m15_confirm(frame, side):
     if frame.empty or len(frame) < 3:
@@ -195,14 +227,14 @@ def build_signal(symbol):
     h4 = resample(hourly_raw, "4h").iloc[:-1]
     w_bias, d_bias = trend_bias(weekly), trend_bias(daily)
 
-    if w_bias and d_bias and w_bias != d_bias:
-        return None, "Weekly і Daily суперечать один одному"
-    side = d_bias or w_bias
-    if not side:
-        return None, "немає чіткого Weekly/Daily напрямку"
+    if not w_bias or not d_bias:
+        return None, "немає чіткого напрямку одночасно на Weekly і Daily"
+    if w_bias != d_bias:
+        return None, "Weekly і Daily не збігаються"
+    side = w_bias
     h4_bias = trend_bias(h4)
-    if h4_bias and h4_bias != side:
-        return None, "H4 суперечить старшому контексту"
+    if not h4_bias or h4_bias != side:
+        return None, "H4 не підтверджує напрямок Weekly + Daily"
 
     poi = find_h4_poi(h4, side)
     if poi is None:
@@ -233,8 +265,8 @@ def build_signal(symbol):
     # Quality score: hard confirmations remain mandatory; score distinguishes
     # stronger alignment from merely acceptable setups.
     score = 0
-    score += 25 if w_bias == side and d_bias == side else 18 if d_bias == side else 12
-    score += 15 if h4_bias == side else 8
+    score += 30 if w_bias == side and d_bias == side else 0
+    score += 20 if h4_bias == side else 0
     score += 20  # price is inside the H4 POI
     score += 20  # H1 BOS + retest confirmed
     score += 20  # M15 candle confirmation
