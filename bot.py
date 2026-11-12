@@ -1,404 +1,361 @@
 import os
 import json
 import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import asyncio
+from datetime import datetime, timezone
+from pathlib import Path
+
 import pandas as pd
 import yfinance as yf
+from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes
+)
 
-TOKEN = "".join(os.getenv("TELEGRAM_BOT_TOKEN", "").split())
-INTERVAL = max(5, int(os.getenv("SCAN_INTERVAL_MINUTES", "15")))
-MIN_RR = max(2.0, float(os.getenv("MIN_RISK_REWARD", "2.0")))
+# ============================================================
+# DMYTRO GOLD SIGNALS — TDA SYNC INTRADAY
+# Manual alerts only. The bot never opens trades.
+# Yahoo Finance data are indicative; CFDs/broker prices may differ.
+# ============================================================
 
-SUBSCRIBERS_FILE = "subscribers.json"
-ALERTS_FILE = "alerts.json"
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+SCAN_MINUTES = int(os.getenv("SCAN_MINUTES", "15"))
+MIN_RR = 2.0
+DATA_PERIOD = "60d"
 
-# Yahoo Finance reference tickers; symbols/prices may differ from broker CFDs.
+SUBSCRIBERS_FILE = Path("subscribers.json")
+ALERTS_FILE = Path("alerts.json")
+
 SYMBOLS = {
-    "BTCUSD": "BTC-USD",
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "EURJPY": "EURJPY=X",
-    "AUDUSD": "AUDUSD=X",
-    "XAGUSD": "XAGUSD=X",
-    "EURAUD": "EURAUD=X",
-    "USDCHF": "CHF=X",
-    "GBPAUD": "GBPAUD=X",
-    "GER40": "^GDAXI",
+    "BTCUSD": {"ticker": "BTC-USD", "kind": "crypto"},
+    "EURUSD": {"ticker": "EURUSD=X", "kind": "fx"},
+    "GBPUSD": {"ticker": "GBPUSD=X", "kind": "fx"},
+    "EURJPY": {"ticker": "EURJPY=X", "kind": "fx"},
+    "AUDUSD": {"ticker": "AUDUSD=X", "kind": "fx"},
+    "XAGUSD": {"ticker": "XAGUSD=X", "fallback": "SI=F", "kind": "metal"},
+    "EURAUD": {"ticker": "EURAUD=X", "kind": "fx"},
+    "USDCHF": {"ticker": "CHF=X", "kind": "fx"},
+    "GBPAUD": {"ticker": "GBPAUD=X", "kind": "fx"},
+    "GER40": {"ticker": "^GDAXI", "kind": "index"},
 }
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 log = logging.getLogger("dmytro-gold-signals")
-SUBSCRIBERS = set()
-ALERTED = set()
 
-
-def load_json(path, default):
+def read_json(path: Path, default):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
     except (OSError, ValueError, TypeError):
-        return default
+        log.exception("Could not read %s", path)
+    return default
 
-
-def save_json(path, data):
+def write_json(path: Path, data):
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except OSError:
-        log.exception("Cannot save %s", path)
+        log.exception("Could not write %s", path)
 
+SUBSCRIBERS = set(int(x) for x in read_json(SUBSCRIBERS_FILE, []))
+ALERTED = set(read_json(ALERTS_FILE, []))
 
-def load_state():
-    global SUBSCRIBERS, ALERTED
-    SUBSCRIBERS = {int(x) for x in load_json(SUBSCRIBERS_FILE, [])}
-    ALERTED = set(load_json(ALERTS_FILE, []))
+def add_subscriber(chat_id: int):
+    SUBSCRIBERS.add(chat_id)
+    write_json(SUBSCRIBERS_FILE, sorted(SUBSCRIBERS))
 
+def normalize_frame(frame):
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = frame.columns.get_level_values(0)
+    frame = frame.copy()
+    frame.columns = [str(c).lower().replace(" ", "_") for c in frame.columns]
+    required = {"open", "high", "low", "close"}
+    if not required.issubset(frame.columns):
+        return pd.DataFrame()
+    frame = frame.dropna(subset=["open", "high", "low", "close"])
+    return frame
 
-def download(ticker, period, interval):
+def download_data(ticker: str, interval: str, period: str = DATA_PERIOD):
     try:
-        df = yf.download(
-            ticker, period=period, interval=interval,
-            progress=False, threads=False, auto_adjust=False
+        raw = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            group_by="column",
+            timeout=15,
         )
-        if df is None or df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
-        needed = ["open", "high", "low", "close"]
-        if not all(c in df.columns for c in needed):
-            return pd.DataFrame()
-        if "volume" not in df.columns:
-            df["volume"] = 0.0
-        df = df[needed + ["volume"]].apply(pd.to_numeric, errors="coerce")
-        df = df.dropna(subset=needed)
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        else:
-            df.index = df.index.tz_convert("UTC")
-        return df.sort_index()
-    except Exception:
-        log.exception("Download failed: %s %s", ticker, interval)
+        return normalize_frame(raw)
+    except Exception as exc:
+        log.warning("Yahoo download failed for %s %s: %s", ticker, interval, exc)
         return pd.DataFrame()
 
+def download_symbol_data(symbol: str):
+    cfg = SYMBOLS[symbol]
+    ticker = cfg["ticker"]
+    # Weekly and daily for higher-timeframe bias; 1h is resampled to 4h.
+    weekly = download_data(ticker, "1wk", "2y")
+    daily = download_data(ticker, "1d", "1y")
+    hourly = download_data(ticker, "1h", "60d")
+    m15 = download_data(ticker, "15m", "60d")
 
-def resample_ohlcv(df, rule):
-    if df.empty:
-        return pd.DataFrame()
-    return df.resample(rule, label="left", closed="left").agg({
-        "open": "first", "high": "max", "low": "min",
-        "close": "last", "volume": "sum"
-    }).dropna(subset=["open", "high", "low", "close"])
+    if cfg.get("fallback") and (weekly.empty or daily.empty or hourly.empty):
+        fallback = cfg["fallback"]
+        weekly = weekly if not weekly.empty else download_data(fallback, "1wk", "2y")
+        daily = daily if not daily.empty else download_data(fallback, "1d", "1y")
+        hourly = hourly if not hourly.empty else download_data(fallback, "1h", "60d")
+        m15 = m15 if not m15.empty else download_data(fallback, "15m", "60d")
 
+    h4 = pd.DataFrame()
+    if not hourly.empty:
+        h4 = hourly.resample("4h").agg({
+            "open": "first", "high": "max", "low": "min",
+            "close": "last",
+            **({"volume": "sum"} if "volume" in hourly.columns else {})
+        }).dropna(subset=["open", "high", "low", "close"])
+    return weekly, daily, h4, hourly, m15
 
-def ema_bias(df):
-    if df.empty or len(df) < 55:
-        return "NONE"
-    c = df["close"].astype(float)
-    e20 = c.ewm(span=20, adjust=False).mean().iloc[-1]
-    e50 = c.ewm(span=50, adjust=False).mean().iloc[-1]
-    p = float(c.iloc[-1])
-    if p > e20 > e50:
-        return "BUY"
-    if p < e20 < e50:
-        return "SELL"
-    return "NONE"
-
-
-def swing_levels(df, lookback=20):
-    """Simple confirmed range levels; approximation of strong high/low."""
-    if df.empty or len(df) < lookback + 3:
-        return None, None
-    window = df.iloc[-(lookback + 1):-1]
-    return float(window["high"].max()), float(window["low"].min())
-
-
-def detect_htf_poi(df, bias, lookback=30):
-    """
-    Heuristic POI: most recent opposing candle before an impulse.
-    This is a mechanical approximation, not discretionary institutional order flow.
-    """
-    if df.empty or len(df) < lookback + 5 or bias not in ("BUY", "SELL"):
+def bias(frame: pd.DataFrame):
+    if frame.empty or len(frame) < 30:
         return None
-    recent = df.iloc[-(lookback + 1):-1]
-    atr = (
-        pd.concat([
-            df["high"] - df["low"],
-            (df["high"] - df["close"].shift()).abs(),
-            (df["low"] - df["close"].shift()).abs(),
-        ], axis=1).max(axis=1).rolling(14).mean()
-    )
-    for i in range(len(recent) - 2, -1, -1):
-        candle = recent.iloc[i]
-        nxt = recent.iloc[i + 1]
-        impulse = abs(float(nxt["close"]) - float(nxt["open"]))
-        a = float(atr.loc[nxt.name]) if nxt.name in atr.index and pd.notna(atr.loc[nxt.name]) else 0.0
-        if a <= 0 or impulse < 1.2 * a:
-            continue
-        if bias == "BUY" and float(candle["close"]) < float(candle["open"]):
-            return (float(candle["low"]), float(candle["high"]))
-        if bias == "SELL" and float(candle["close"]) > float(candle["open"]):
-            return (float(candle["low"]), float(candle["high"]))
+    close = frame["close"]
+    fast = close.ewm(span=20, adjust=False).mean()
+    slow = close.ewm(span=50, adjust=False).mean()
+    last = float(close.iloc[-1])
+    if fast.iloc[-1] > slow.iloc[-1] and last > fast.iloc[-1]:
+        return "BUY"
+    if fast.iloc[-1] < slow.iloc[-1] and last < fast.iloc[-1]:
+        return "SELL"
     return None
 
-
-def poi_touched(df, poi):
-    if df.empty or poi is None:
-        return False
-    lo, hi = poi
-    last = df.iloc[-1]
-    return float(last["low"]) <= hi and float(last["high"]) >= lo
-
-
-def order_flow_proxy(df, side):
-    """OHLCV proxy only; not true exchange bid/ask delta."""
-    if df.empty:
-        return False, "даних немає"
-    last = df.iloc[-1]
-    rng = max(float(last["high"]) - float(last["low"]), 1e-12)
-    close_pos = (float(last["close"]) - float(last["low"])) / rng
-    if side == "BUY":
-        candle_ok = float(last["close"]) > float(last["open"]) and close_pos >= 0.65
-    else:
-        candle_ok = float(last["close"]) < float(last["open"]) and close_pos <= 0.35
-    vol = float(last.get("volume", 0.0))
-    avg = float(df.iloc[-21:-1]["volume"].mean()) if len(df) > 21 else 0.0
-    if vol > 0 and avg > 0:
-        vol_ok = vol >= avg
-        detail = f"обсяг {vol:.0f} / середній {avg:.0f}"
-    else:
-        body = abs(float(last["close"]) - float(last["open"])) / rng
-        vol_ok = body >= 0.60
-        detail = f"тіло свічки {body:.0%}; обсяг недоступний"
-    return candle_ok and vol_ok, detail
-
-
-def intraday_entry(h1, m15, direction, poi):
-    """H1 BOS + retest, then M15 candle/volume confirmation."""
-    if h1.empty or m15.empty or len(h1) < 30 or len(m15) < 30:
-        return None, "Недостатньо історії H1/15M"
-
-    # Require latest completed H1 candle to interact with HTF POI.
-    if poi is None or not poi_touched(h1, poi):
-        return None, "Ціна не тестує HTF POI"
-
-    h = h1.copy()
-    last_h1 = h.iloc[-1]
-    prior = h.iloc[-21:-1]
-    range_high = float(prior["high"].max())
-    range_low = float(prior["low"].min())
-
-    # A breakout and retest are required, not just a moving-average cross.
+def find_poi(frame: pd.DataFrame, direction: str):
+    """Approximate recent H4 demand/supply zone from recent candle range."""
+    if frame.empty or len(frame) < 12:
+        return None
+    recent = frame.iloc[-12:-1]
+    last = frame.iloc[-1]
     if direction == "BUY":
-        bos_seen = (h.iloc[-6:-1]["close"] > range_high).any()
-        retest = float(last_h1["low"]) <= range_high and float(last_h1["close"]) > range_high
-        if not (bos_seen and retest):
-            return None, "Немає H1 BOS + Retest"
-        mside_ok = float(m15.iloc[-1]["close"]) > float(m15.iloc[-1]["open"])
-        swing_sl = float(h.iloc[-11:-1]["low"].min())
-        sl = min(swing_sl, poi[0])
+        candle = recent.loc[recent["close"] < recent["open"]]
+        if candle.empty:
+            return None
+        row = candle.iloc[-1]
+        low, high = float(row["low"]), float(max(row["open"], row["close"]))
+        price = float(last["close"])
+        if low <= price <= high * 1.003:
+            return (low, high)
     else:
-        bos_seen = (h.iloc[-6:-1]["close"] < range_low).any()
-        retest = float(last_h1["high"]) >= range_low and float(last_h1["close"]) < range_low
-        if not (bos_seen and retest):
-            return None, "Немає H1 BOS + Retest"
-        mside_ok = float(m15.iloc[-1]["close"]) < float(m15.iloc[-1]["open"])
-        swing_sl = float(h.iloc[-11:-1]["high"].max())
-        sl = max(swing_sl, poi[1])
+        candle = recent.loc[recent["close"] > recent["open"]]
+        if candle.empty:
+            return None
+        row = candle.iloc[-1]
+        low, high = float(min(row["open"], row["close"])), float(row["high"])
+        price = float(last["close"])
+        if low * 0.997 <= price <= high:
+            return (low, high)
+    return None
 
-    flow_ok, flow_text = order_flow_proxy(m15, direction)
-    if not mside_ok or not flow_ok:
-        return None, "15M не підтвердив напрямок / Order Flow"
+def h1_bos_retest(hourly: pd.DataFrame, direction: str):
+    if hourly.empty or len(hourly) < 25:
+        return None
+    # Exclude current candle when defining the structure level.
+    hist = hourly.iloc[-21:-2]
+    last = hourly.iloc[-1]
+    prev = hourly.iloc[-2]
+    close = float(last["close"])
+    if direction == "BUY":
+        level = float(hist["high"].max())
+        broke = float(prev["close"]) > level or close > level
+        retest = float(last["low"]) <= level * 1.0015 and close >= level
+        if broke and retest:
+            return level
+    else:
+        level = float(hist["low"].min())
+        broke = float(prev["close"]) < level or close < level
+        retest = float(last["high"]) >= level * 0.9985 and close <= level
+        if broke and retest:
+            return level
+    return None
 
-    entry = float(m15.iloc[-1]["close"])
-    risk = entry - sl if direction == "BUY" else sl - entry
-    if risk <= 0:
-        return None, "Некоректний SL відносно Entry"
-    tp = entry + MIN_RR * risk if direction == "BUY" else entry - MIN_RR * risk
+def m15_confirm(m15: pd.DataFrame, direction: str):
+    if m15.empty or len(m15) < 5:
+        return False
+    last = m15.iloc[-1]
+    prev = m15.iloc[-2]
+    if direction == "BUY":
+        return float(last["close"]) > float(last["open"]) and float(last["close"]) > float(prev["high"])
+    return float(last["close"]) < float(last["open"]) and float(last["close"]) < float(prev["low"])
+
+def make_signal(symbol: str):
+    weekly, daily, h4, hourly, m15 = download_symbol_data(symbol)
+    if any(x.empty for x in (weekly, daily, h4, hourly, m15)):
+        return None, "немає даних на одному з таймфреймів"
+
+    wb = bias(weekly)
+    db = bias(daily)
+    if wb is None or db is None or wb != db:
+        return None, "Weekly/Daily Bias не синхронізовані"
+
+    direction = wb
+    poi = find_poi(h4, direction)
+    if poi is None:
+        return None, "ціна не в алгоритмічній H4 POI"
+
+    bos_level = h1_bos_retest(hourly, direction)
+    if bos_level is None:
+        return None, "немає підтвердження H1 BOS + Retest"
+
+    if not m15_confirm(m15, direction):
+        return None, "немає підтвердження M15"
+
+    entry = float(hourly["close"].iloc[-1])
+    recent = hourly.iloc[-12:]
+    if direction == "BUY":
+        sl = min(float(recent["low"].min()), float(poi[0]))
+        risk = entry - sl
+        if risk <= 0:
+            return None, "некоректний стоп для BUY"
+        tp = entry + MIN_RR * risk
+    else:
+        sl = max(float(recent["high"].max()), float(poi[1]))
+        risk = sl - entry
+        if risk <= 0:
+            return None, "некоректний стоп для SELL"
+        tp = entry - MIN_RR * risk
+
+    if tp <= 0:
+        return None, "некоректний розрахунок TP"
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
+    signal_id = f"{symbol}-{direction}-{stamp}"
     return {
-        "side": direction, "entry": entry, "sl": sl, "tp": tp,
-        "flow": flow_text,
-        "time": m15.index[-1].strftime("%Y-%m-%d %H:%M UTC"),
-    }, "Signal"
+        "id": signal_id, "symbol": symbol, "direction": direction,
+        "entry": entry, "sl": sl, "tp": tp, "rr": MIN_RR,
+        "poi": poi, "time": datetime.now(timezone.utc).isoformat()
+    }, None
 
+def fmt_price(value):
+    if abs(value) >= 1000:
+        return f"{value:.2f}"
+    if abs(value) >= 10:
+        return f"{value:.4f}"
+    return f"{value:.5f}"
 
-def fmt_price(symbol, value):
-    if symbol in ("BTCUSD", "GER40"):
-        return f"{value:,.2f}"
-    if symbol == "XAGUSD":
-        return f"{value:.3f}"
-    if "JPY" in symbol:
-        return f"{value:.3f}"
-    return f"{value:.5f}" if abs(value) < 10 else f"{value:.4f}"
-
-
-def format_signal(symbol, sig, weekly_bias, daily_bias, daily_poi, h4_poi):
-    arrow = "🟢" if sig["side"] == "BUY" else "🔴"
+def format_signal(s):
+    arrow = "🟢" if s["direction"] == "BUY" else "🔴"
     return (
-        f"{arrow} <b>{sig['side']} — {symbol}</b>\\n"
-        "Модель: TDA Sync Intraday\\n"
-        f"Weekly Bias: {weekly_bias} | Daily Bias: {daily_bias}\\n"
-        f"Daily POI: {daily_poi[0]:.5f}–{daily_poi[1]:.5f}\\n"
-        f"H4 POI: {h4_poi[0]:.5f}–{h4_poi[1]:.5f}\\n"
-        "Підтвердження: H1 BOS + Retest → 15M Confirm\\n\\n"
-        f"Entry: {fmt_price(symbol, sig['entry'])}\\n"
-        f"SL: {fmt_price(symbol, sig['sl'])} (за Strong High/Low)\\n"
-        f"TP: {fmt_price(symbol, sig['tp'])}\\n"
-        f"RR: 1:{MIN_RR:.1f}\\n"
-        f"Order Flow proxy: {sig['flow']}\\n"
-        f"Закрита 15M свічка: {sig['time']}\\n\\n"
-        "⚠️ POI/Strong High-Low визначаються алгоритмічно як наближення. "
-        "Order Flow — OHLCV-оцінка, не справжня Bid/Ask Delta. "
-        "Yahoo Finance може відрізнятися від CFD-брокера. Перевір сигнал у MT5."
+        f"{arrow} TDA SYNC INTRADAY — {s['symbol']} {s['direction']}\\n"
+        f"Entry: {fmt_price(s['entry'])}\\n"
+        f"SL: {fmt_price(s['sl'])}\\n"
+        f"TP: {fmt_price(s['tp'])}\\n"
+        f"RR: 1:{s['rr']:.1f}\\n"
+        f"TF: W1/D1 → H4 POI → H1 BOS+Retest → M15 Confirm\\n"
+        f"Час UTC: {s['time'][11:16]}\\n"
+        f"⚠️ Аналітичний сигнал, не фінансова рекомендація. Перевір котирування у своєму брокері."
     )
-
-
-async def scan(app, report_chat=None):
-    sent, errors = 0, 0
-    notes = []
-    for symbol, ticker in SYMBOLS.items():
-        try:
-            h1raw = download(ticker, "60d", "1h")
-            m15raw = download(ticker, "60d", "15m")
-            d1raw = download(ticker, "2y", "1d")
-            w1raw = download(ticker, "5y", "1wk")
-            if any(x.empty for x in (h1raw, m15raw, d1raw, w1raw)):
-                errors += 1
-                notes.append(f"{symbol}: немає даних для одного з TF")
-                continue
-
-            # Use only completed candles.
-            h1 = h1raw.iloc[:-1]
-            m15 = m15raw.iloc[:-1]
-            d1 = d1raw.iloc[:-1]
-            w1 = w1raw.iloc[:-1]
-            h4 = resample_ohlcv(h1raw, "4h").iloc[:-1]
-
-            wb = ema_bias(w1)
-            db = ema_bias(d1)
-            if wb not in ("BUY", "SELL") or db != wb:
-                notes.append(f"{symbol}: Weekly/Daily Bias не синхронізовані")
-                continue
-
-            daily_poi = detect_htf_poi(d1, db)
-            h4_poi = detect_htf_poi(h4, db)
-            if daily_poi is None or h4_poi is None:
-                notes.append(f"{symbol}: не знайдено алгоритмічний Daily/H4 POI")
-                continue
-
-            # Price must be within or testing the Daily/H4 area.
-            if not (poi_touched(h1, daily_poi) and poi_touched(h1, h4_poi)):
-                notes.append(f"{symbol}: ціна не в HTF POI")
-                continue
-
-            sig, reason = intraday_entry(h1, m15, db, h4_poi)
-            if sig is None:
-                notes.append(f"{symbol}: {reason}")
-                continue
-
-            key = f"{symbol}|{sig['side']}|{sig['time']}"
-            if key in ALERTED:
-                notes.append(f"{symbol}: сигнал цієї свічки вже надсилався")
-                continue
-            if not SUBSCRIBERS:
-                notes.append(f"{symbol}: немає підписників — натисни /start")
-                continue
-
-            msg = format_signal(symbol, sig, wb, db, daily_poi, h4_poi)
-            delivered = False
-            for chat_id in list(SUBSCRIBERS):
-                try:
-                    await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
-                    delivered = True
-                    sent += 1
-                except Exception:
-                    log.exception("Telegram send failed for %s", symbol)
-            if delivered:
-                ALERTED.add(key)
-                save_json(ALERTS_FILE, sorted(ALERTED)[-3000:])
-                notes.append(f"{symbol}: сигнал надіслано")
-        except Exception as exc:
-            errors += 1
-            log.exception("Scan failed for %s", symbol)
-            notes.append(f"{symbol}: {type(exc).__name__}: {str(exc)[:100]}")
-
-    if report_chat is not None:
-        report = (
-            f"Сканування завершено. Інструментів: {len(SYMBOLS)}. "
-            f"Надісланих повідомлень: {sent}. Помилок: {errors}.\\n\\n"
-            + "\\n".join("• " + n for n in notes)
-        )
-        for i in range(0, len(report), 3900):
-            await app.bot.send_message(chat_id=report_chat, text=report[i:i + 3900])
-
-
-async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
-    await scan(context.application)
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    SUBSCRIBERS.add(update.effective_chat.id)
-    save_json(SUBSCRIBERS_FILE, sorted(SUBSCRIBERS))
-    await update.effective_message.reply_text(
+    chat_id = update.effective_chat.id
+    add_subscriber(chat_id)
+    await update.message.reply_text(
         "Dmytro Gold Signals активний.\\n"
-        f"Інструментів: {len(SYMBOLS)}; сканування кожні {INTERVAL} хв.\\n"
-        "TDA Sync Intraday: Weekly/Daily Bias → Daily/H4 POI → H1 BOS+Retest → 15M Confirm.\\n"
-        "Один TP; мінімальний RR 1:2. Бот не відкриває угоди."
+        "Ти підписаний на сигнали. Бот не відкриває угоди.\\n"
+        "Команди: /status /symbols /scan"
     )
-
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
+    await update.message.reply_text(
         f"Бот активний. Інструментів: {len(SYMBOLS)}.\\n"
-        "Модель: TDA Sync Intraday. Weekly/Daily Bias; Daily/H4 POI; "
-        "H1 BOS+Retest; 15M Confirm. Один TP; мінімальний RR 1:2.\\n"
-        f"Сканування: {INTERVAL} хв. Підписників: {len(SUBSCRIBERS)}.\\n"
-        "POI/Order Flow — алгоритмічні наближення, не біржові дані."
+        f"Модель: TDA Sync Intraday. W1/D1 Bias → H4 POI → "
+        f"H1 BOS+Retest → M15 Confirm.\\n"
+        f"Один TP; мінімальний RR 1:2.\\n"
+        f"Сканування: кожні {SCAN_MINUTES} хв.\\n"
+        f"Підписників: {len(SUBSCRIBERS)}.\\n"
+        "Дані Yahoo Finance; POI/Order Flow — алгоритмічні наближення, не біржовий Delta."
     )
 
+async def symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Інструменти: " + ", ".join(SYMBOLS.keys()))
 
-async def symbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "Інструменти:\\n" + "\\n".join("• " + s for s in SYMBOLS)
-    )
+async def scan_all(application: Application, notify: bool = True):
+    results = []
+    errors = []
+    for symbol in SYMBOLS:
+        try:
+            signal, reason = await asyncio.to_thread(make_signal, symbol)
+            if signal:
+                results.append(signal)
+            else:
+                errors.append(f"• {symbol}: {reason}")
+        except Exception as exc:
+            log.exception("Scan error for %s", symbol)
+            errors.append(f"• {symbol}: технічна помилка ({type(exc).__name__})")
 
+    sent = 0
+    for signal in results:
+        if signal["id"] in ALERTED:
+            continue
+        msg = format_signal(signal)
+        for chat_id in list(SUBSCRIBERS):
+            try:
+                await application.bot.send_message(chat_id=chat_id, text=msg)
+                sent += 1
+            except Exception:
+                log.exception("Could not send signal to chat %s", chat_id)
+        ALERTED.add(signal["id"])
+        write_json(ALERTS_FILE, sorted(ALERTED))
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "/start — підписатися\\n/status — стан\\n"
-        "/symbols — список інструментів\\n/scan — сканувати зараз\\n/help — команди"
-    )
+    if not notify:
+        return sent, errors, len(results)
 
+    return sent, errors, len(results)
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        f"Сканую {len(SYMBOLS)} інструментів за TDA Sync. Це може тривати кілька хвилин."
+    await update.message.reply_text(
+        f"Сканую {len(SYMBOLS)} інструментів. Це може тривати кілька хвилин."
     )
-    await scan(context.application, update.effective_chat.id)
+    sent, errors, found = await scan_all(context.application, notify=False)
+    summary = [
+        "Сканування завершено.",
+        f"Інструментів: {len(SYMBOLS)}.",
+        f"Знайдено сигналів: {found}.",
+        f"Надіслано повідомлень: {sent}.",
+    ]
+    if errors:
+        summary.append("Причини відсутності сигналів:\\n" + "\\n".join(errors[:10]))
+    await update.message.reply_text("\\n".join(summary))
 
+async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
+    await scan_all(context.application, notify=False)
 
-async def post_init(app: Application):
-    load_state()
-    if app.job_queue is None:
-        raise RuntimeError("Встанови python-telegram-bot[job-queue] у requirements.txt")
-    app.job_queue.run_repeating(
-        scheduled_scan, interval=INTERVAL * 60, first=20, name="tda-market-scan"
-    )
-    log.info("TDA bot started: symbols=%d subscribers=%d", len(SYMBOLS), len(SUBSCRIBERS))
-
+async def post_init(application: Application):
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            scheduled_scan,
+            interval=SCAN_MINUTES * 60,
+            first=30,
+            name="scheduled_market_scan",
+        )
+    else:
+        log.error("JobQueue is unavailable. Install python-telegram-bot[job-queue].")
 
 def main():
     if not TOKEN:
-        raise RuntimeError("Не задано TELEGRAM_BOT_TOKEN у Railway Variables")
+        raise RuntimeError("Встанови TELEGRAM_BOT_TOKEN у Railway → Variables.")
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("symbols", symbols_command))
+    app.add_handler(CommandHandler("symbols", symbols))
     app.add_handler(CommandHandler("scan", scan_command))
-    app.add_handler(CommandHandler("help", help_command))
+    log.info("Starting Dmytro Gold Signals with %d symbols", len(SYMBOLS))
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
