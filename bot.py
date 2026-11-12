@@ -230,9 +230,27 @@ def build_signal(symbol):
     if reward <= 0 or rr < MIN_RR:
         return None, f"потенціал малий: RR 1:{rr:.2f}, мінімум 1:{MIN_RR:.2f}"
 
+    # Quality score: hard confirmations remain mandatory; score distinguishes
+    # stronger alignment from merely acceptable setups.
+    score = 0
+    score += 25 if w_bias == side and d_bias == side else 18 if d_bias == side else 12
+    score += 15 if h4_bias == side else 8
+    score += 20  # price is inside the H4 POI
+    score += 20  # H1 BOS + retest confirmed
+    score += 20  # M15 candle confirmation
+    # Reward a clean impulse candle, but never treat volume as true order flow.
+    last_m15 = m15.iloc[-1]
+    candle_range = max(float(last_m15.high) - float(last_m15.low), 1e-12)
+    body_ratio = abs(float(last_m15.close) - float(last_m15.open)) / candle_range
+    if body_ratio >= 0.65:
+        score += 5
+    score = min(score, 100)
+    if score < 80:
+        return None, f"якість сетапу {score}/100 — нижче порогу 80"
+
     return {
         "symbol": symbol, "side": side, "entry": entry, "sl": sl, "tp": tp,
-        "rr": rr, "time": str(m15.index[-1]),
+        "rr": rr, "score": score, "time": str(m15.index[-1]),
         "w": w_bias or "нейтральний", "d": d_bias or "нейтральний",
         "h4": h4_bias or "нейтральний"
     }, None
