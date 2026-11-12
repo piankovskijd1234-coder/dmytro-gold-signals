@@ -10,7 +10,7 @@ TOKEN = "".join(os.getenv("TELEGRAM_BOT_TOKEN", "").split())
 INTERVAL = max(5, int(os.getenv("SCAN_INTERVAL_MINUTES", "5")))
 SUBSCRIBERS_FILE = "subscribers.json"
 ALERTS_FILE = "alerts.json"
-ACTIVE_FILE = "active_signals.json
+ACTIVE_FILE = "active_signals.json"
 SYMBOLS = {
 "BTCUSD": "BTC-USD",
 "EURUSD": "EURUSD=X",
